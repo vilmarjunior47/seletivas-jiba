@@ -2692,7 +2692,7 @@ const DB = (() => {
       chaveamento = getChaveamento(chaveamentoExistenteId);
       atualizarChaveamento(chaveamento.id, {
         status: 'Em andamento', disputaTerceiro,
-        campeaoAlunoId: null, viceAlunoId: null, terceiroAlunoId: null
+        campeaoAlunoId: null, viceAlunoId: null, terceiroAlunoId: null, participanteUnico: false
       });
       // remove confrontos e participantes antigos deste chaveamento (não afeta alunos/inscrições)
       salvarLista(CHAVES.confrontosChaveamento, lerLista(CHAVES.confrontosChaveamento).filter(c => c.chaveamentoId !== chaveamento.id));
@@ -2712,6 +2712,23 @@ const DB = (() => {
     }
 
     const N = participantesEmbaralhados.length;
+
+    // Alteração pontual: participante único -- não cria confronto nem
+    // BYE algum. O próprio chaveamento já nasce Finalizado, com esse
+    // aluno como campeão (`participanteUnico:true` para a interface
+    // deixar claro que não houve partida). Repescagem/Final nunca fazem
+    // sentido aqui (não há perdedor), então nada mais precisa mudar --
+    // DB.podeGerarRepescagem já retorna false com 0 perdedores.
+    if(N === 1){
+      const unico = participantesEmbaralhados[0];
+      const participanteUnico = { id: gerarId(), chaveamentoId: chaveamento.id, alunoId: unico.id, presente:true, ordemSorteio:0, bye:false };
+      salvarLista(CHAVES.participantesChaveamento, [...lerLista(CHAVES.participantesChaveamento), participanteUnico]);
+      atualizarChaveamento(chaveamento.id, {
+        status: 'Finalizado', campeaoAlunoId: unico.id, viceAlunoId: null, terceiroAlunoId: null, participanteUnico: true
+      });
+      return getChaveamento(chaveamento.id);
+    }
+
     let size = 2;
     while(size < N) size *= 2;
     const numByes = size - N;
@@ -3139,6 +3156,98 @@ const DB = (() => {
     const { principal, repescagem } = obterFamiliaChaveamento(chaveamentoPrincipalId);
     if(!principal || !principal.campeaoAlunoId || repescagem) return false;
     return obterPerdedoresChaveamento(chaveamentoPrincipalId).length >= 2;
+  }
+
+  /* ============================================================
+     CLASSIFICADOS PARA O JIBA (novo)
+     ------------------------------------------------------------
+     NÃO altera o motor (sorteio/BYE/avanço/repescagem/final/W.O./
+     correção continuam exatamente como estão). É só uma LEITURA
+     derivada dos dados que já existem: campeão/vice/terceiro (já
+     gravados por atualizarResultadosFinaisSeAplicavel) + a fase em
+     que cada participante foi eliminado (já registrada em cada
+     confronto). "Quantidade de classificados" é um campo novo,
+     opcional, gravado no chaveamento definitivo (a Final, ou o
+     próprio Principal quando não há repescagem/final).
+  ============================================================ */
+
+  // Em que fase (faseIndex) este aluno perdeu, dentro de UM chaveamento
+  // específico. Retorna Infinity se ele é o campeão daquele chaveamento,
+  // e -1 se ele nem participou dele.
+  function faseEliminacaoNoBracket(chaveamento, alunoId){
+    if(!chaveamento) return -1;
+    if(chaveamento.campeaoAlunoId === alunoId) return Infinity;
+    const confrontos = getConfrontos(chaveamento.id).filter(c => !c.terceiroLugar);
+    const confrontoDerrota = confrontos.find(c => c.perdedorAlunoId === alunoId);
+    if(confrontoDerrota) return confrontoDerrota.faseIndex;
+    const participou = confrontos.some(c => c.alunoAId === alunoId || c.alunoBId === alunoId)
+      || getParticipantesChaveamento(chaveamento.id).some(p => p.alunoId === alunoId);
+    return participou ? -1 : -1; // participou mas ainda não foi eliminado (chave em andamento) -- trata como -1 (sem posição definida ainda)
+  }
+
+  // Classificação final completa (1º, 2º, 3º, 4º...), derivada dos dados
+  // já existentes. 1º/2º/3º vêm de campeaoAlunoId/viceAlunoId/terceiroAlunoId
+  // (exatamente como já são exibidos hoje). A partir do 4º lugar, ordena
+  // pela fase em que cada um foi eliminado -- prioriza quem chegou mais
+  // longe na Repescagem (é ela que dá a "segunda chance" depois do
+  // Principal); em caso de empate na mesma fase, usa a ordem original do
+  // sorteio/definição manual (estável e determinística, sem inventar
+  // diferença onde nenhuma partida decidiu).
+  function classificacaoFinalChaveamento(raizId){
+    const { principal, repescagem, final } = obterFamiliaChaveamento(raizId);
+    if(!principal) return [];
+    const vencedorGeral = final ? final.campeaoAlunoId : principal.campeaoAlunoId;
+    if(!vencedorGeral) return []; // chaveamento ainda não finalizado
+
+    const viceGeral = final ? final.viceAlunoId : principal.viceAlunoId;
+    const terceiroGeral = principal.terceiroAlunoId || null;
+
+    const participantesPrincipal = getParticipantesChaveamento(principal.id);
+    const ordemOriginal = new Map(
+      participantesPrincipal.slice().sort((a, b) => a.ordemSorteio - b.ordemSorteio).map((p, i) => [p.alunoId, i])
+    );
+
+    const jaClassificados = new Set([vencedorGeral, viceGeral, terceiroGeral].filter(Boolean));
+    const restantes = participantesPrincipal.map(p => p.alunoId).filter(id => !jaClassificados.has(id));
+
+    function profundidade(alunoId){
+      const emRepescagem = repescagem ? faseEliminacaoNoBracket(repescagem, alunoId) : -1;
+      if(emRepescagem >= 0) return 1000 + emRepescagem;
+      return faseEliminacaoNoBracket(principal, alunoId);
+    }
+
+    restantes.sort((a, b) => {
+      const diff = profundidade(b) - profundidade(a);
+      if(diff !== 0) return diff;
+      return (ordemOriginal.get(a) ?? 0) - (ordemOriginal.get(b) ?? 0);
+    });
+
+    const ordenados = [vencedorGeral, viceGeral, terceiroGeral].filter(Boolean).concat(restantes);
+    return ordenados.map((alunoId, idx) => ({ posicao: idx + 1, aluno: getAluno(alunoId) })).filter(item => item.aluno);
+  }
+
+  // Grava quantos primeiros colocados devem ser considerados
+  // "classificados para o JIBA". Salvo no chaveamento DEFINITIVO (Final,
+  // ou o próprio Principal quando não há repescagem/final) -- o mesmo
+  // registro que já guarda campeaoAlunoId/viceAlunoId.
+  function definirQuantidadeClassificados(chaveamentoId, quantidade){
+    atualizarChaveamento(chaveamentoId, { quantidadeClassificados: quantidade });
+  }
+
+  // Lê a quantidade configurada (a partir de QUALQUER chaveamento da
+  // família) e devolve a lista já cortada -- é isto que a interface e a
+  // impressão usam. Não duplica inscrição nem move aluno de turma; é
+  // pura leitura sobre dados que já existem.
+  function classificadosChaveamento(raizId){
+    const { principal, final } = obterFamiliaChaveamento(raizId);
+    const definitivo = final || principal;
+    if(!definitivo) return { quantidade: 0, definitivoId: null, classificacao: [], classificados: [] };
+    const quantidade = definitivo.quantidadeClassificados || 0;
+    const classificacao = classificacaoFinalChaveamento(raizId);
+    return {
+      quantidade, definitivoId: definitivo.id, classificacao,
+      classificados: quantidade > 0 ? classificacao.slice(0, quantidade) : []
+    };
   }
 
   function gerarRepescagem(chaveamentoPrincipalId){
@@ -3899,6 +4008,7 @@ const DB = (() => {
     calcularDetalhamentoTurma, calcularClassificacaoDaSerie, resumoModalidadesPontuacao,
     embaralharFisherYates, alunosElegiveisChaveamento, alunosElegiveisChaveamentoContexto,
     getChaveamentosPorContextoGeral, obterNomesFases,
+    classificacaoFinalChaveamento, definirQuantidadeClassificados, classificadosChaveamento,
     marcarFaltaChaveamento, adiarConfronto, retomarConfrontoAdiado,
     previaReorganizacaoChaveamento, reorganizarChaveamento, trocarPosicoesChaveamento,
     alunosDisponiveisParaAdicionar, confrontosComPosicaoDisponivel, adicionarAlunoAoChaveamento,
@@ -7601,7 +7711,7 @@ function cardChaveamentoHtml(c){
     <a href="#/chaveamentos/${c.id}" class="cartao-escolha">
       <div>
         <div class="titulo-escolha">${iconeModalidade(modalidade ? modalidade.nome : '')} ${modalidade ? modalidade.nome : ''} — ${nomeExibidoTurma(c.turmaId)}</div>
-        <div class="sub-escolha">${c.categoria}${campeao ? ' · 🥇 ' + campeao.nome : ''}</div>
+        <div class="sub-escolha">${c.categoria}${campeao ? ' · 🥇 ' + campeao.nome : ''}${c.participanteUnico ? ' · 👤 Participante único' : ''}</div>
       </div>
       <span class="selo-status-seletiva ${c.status === 'Finalizado' ? 'selo-concluida' : 'selo-pendente'}">${c.status === 'Finalizado' ? '✅' : '▶️'}</span>
     </a>
@@ -7780,7 +7890,20 @@ function htmlSelecaoParticipantes(elegiveis){
           <input type="checkbox" name="participanteChave" value="${a.id}" checked> ${a.nome}
         </label>
       `).join('')}
-      <button class="botao botao-primario" id="btnSortearConfrontos" type="button" style="width:100%; margin-top:12px;" ${!elegiveis.length ? 'disabled' : ''}>🎲 Sortear confrontos</button>
+      ${elegiveis.length > 1 ? `
+        <div class="campo" style="margin-top:14px;">
+          <label>Como montar o chaveamento</label>
+          <div class="grade-controle-chave coluna-unica" style="margin-top:6px;">
+            <label class="item-checkbox-modalidade marcado" style="cursor:pointer;">
+              <input type="radio" name="modoMontagem" value="automatico" checked> 🎲 Sorteio automático
+            </label>
+            <label class="item-checkbox-modalidade" style="cursor:pointer;">
+              <input type="radio" name="modoMontagem" value="manual"> ✍️ Definir manualmente
+            </label>
+          </div>
+        </div>
+      ` : ''}
+      <button class="botao botao-primario" id="btnSortearConfrontos" type="button" style="width:100%; margin-top:12px;" ${!elegiveis.length ? 'disabled' : ''}>Continuar</button>
     </div>
   `;
 }
@@ -7866,6 +7989,45 @@ function renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria){
   const area = document.getElementById('areaSorteio');
   if(!area || !previewSorteio) return;
   const N = previewSorteio.alunos.length;
+
+  // Alteração pontual: participante único -- não é sorteio, não é BYE.
+  // Confirmar já cria o chaveamento direto como Finalizado/campeão
+  // (DB.montarChaveamento trata N===1 automaticamente).
+  if(N === 1){
+    const unico = previewSorteio.alunos[0];
+    area.innerHTML = `
+      <div class="bloco" style="text-align:center;">
+        <div style="font-size:13px; font-weight:700; color:var(--texto-suave); text-transform:uppercase; letter-spacing:0.4px;">Participante único</div>
+        <div style="font-size:12.5px; color:var(--texto-suave); margin:6px 0 14px;">Apenas 1 aluno inscrito nesta seletiva — ele será o campeão automaticamente, sem disputar partida.</div>
+        <div class="medalha-grande">🏆</div>
+        <div class="nome-campeao">${unico.nome}</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:10px; margin-top:12px;">
+        <button class="botao botao-primario" id="btnConfirmarSorteio" type="button">Confirmar campeão</button>
+        <button class="botao-texto" id="btnCancelarSorteio" type="button" style="color:#B23A3A;">Cancelar</button>
+      </div>
+    `;
+    document.getElementById('btnConfirmarSorteio').addEventListener('click', () => {
+      const ctx = resolverContextoChaveamento(contextoId);
+      const chaveamento = DB.montarChaveamento({
+        serieId,
+        turmaId: ctx && ctx.tipo === 'turma' ? contextoId : null,
+        agrupamentoId: ctx && ctx.tipo === 'grupo' ? contextoId : null,
+        modalidadeId, categoria,
+        disputaTerceiro: false,
+        participantesEmbaralhados: previewSorteio.alunos
+      });
+      mostrarToast('Campeão registrado (participante único).');
+      previewSorteio = null;
+      location.hash = `#/chaveamentos/${chaveamento.id}`;
+    });
+    document.getElementById('btnCancelarSorteio').addEventListener('click', () => {
+      previewSorteio = null;
+      area.innerHTML = '';
+    });
+    return;
+  }
+
   let size = 2;
   while(size < N) size *= 2;
   const numByes = size - N;
@@ -7878,7 +8040,7 @@ function renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria){
   for(let i = 0; i < semBye.length; i += 2) confrontosPreview.push({ a:semBye[i], b:semBye[i + 1], bye:false });
 
   area.innerHTML = `
-    <div class="secao-titulo">Prévia do sorteio — ${nomesFases[0]}</div>
+    <div class="secao-titulo">${previewSorteio.manual ? 'Confirmar ordem definida' : 'Prévia do sorteio'} — ${nomesFases[0]}</div>
     ${confrontosPreview.map((c, idx) => `
       <div class="cartao-confronto-chave">
         <div style="font-size:12px; color:var(--texto-suave); margin-bottom:6px;">Jogo ${idx + 1}</div>
@@ -7898,8 +8060,8 @@ function renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria){
     </div>
 
     <div style="display:flex; flex-direction:column; gap:10px; margin-top:12px;">
-      <button class="botao botao-primario" id="btnConfirmarSorteio" type="button">Confirmar sorteio</button>
-      <button class="botao botao-secundario" id="btnSortearNovamente" type="button">🎲 Sortear novamente</button>
+      <button class="botao botao-primario" id="btnConfirmarSorteio" type="button">${previewSorteio.manual ? 'Confirmar e montar chave' : 'Confirmar sorteio'}</button>
+      ${!previewSorteio.manual ? '<button class="botao botao-secundario" id="btnSortearNovamente" type="button">🎲 Sortear novamente</button>' : ''}
       <button class="botao-texto" id="btnCancelarSorteio" type="button" style="color:#B23A3A;">Cancelar</button>
     </div>
   `;
@@ -7922,10 +8084,13 @@ function renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria){
     previewSorteio = null;
     location.hash = `#/chaveamentos/${chaveamento.id}`;
   });
-  document.getElementById('btnSortearNovamente').addEventListener('click', () => {
-    previewSorteio.alunos = DB.embaralharFisherYates(previewSorteio.alunos);
-    renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
-  });
+  const btnSortearNovamente = document.getElementById('btnSortearNovamente');
+  if(btnSortearNovamente){
+    btnSortearNovamente.addEventListener('click', () => {
+      previewSorteio.alunos = DB.embaralharFisherYates(previewSorteio.alunos);
+      renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
+    });
+  }
   document.getElementById('btnCancelarSorteio').addEventListener('click', () => {
     previewSorteio = null;
     area.innerHTML = '';
@@ -7944,16 +8109,79 @@ function ligarEventosSelecaoParticipantes(serieId, contextoId, modalidadeId, cat
   if(btnSortear){
     btnSortear.addEventListener('click', () => {
       const selecionados = Array.from(document.querySelectorAll('input[name="participanteChave"]:checked')).map(c => c.value);
-      if(selecionados.length < 2){
-        alert('⚠️ São necessários pelo menos 2 participantes.');
+      // Alteração pontual: 1 participante agora é permitido (campeão
+      // automático, sem confronto) -- só bloqueia com 0 selecionados.
+      if(selecionados.length < 1){
+        alert('⚠️ Selecione pelo menos 1 participante.');
         return;
       }
       const alunos = selecionados.map(id => DB.getAluno(id)).filter(Boolean);
-      previewSorteio = { alunos: DB.embaralharFisherYates(alunos), disputaTerceiro:false };
-      renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
+
+      if(alunos.length === 1){
+        previewSorteio = { alunos, disputaTerceiro:false, manual:false };
+        renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
+        document.getElementById('areaSorteio').scrollIntoView({ behavior:'smooth' });
+        return;
+      }
+
+      const modoManual = document.querySelector('input[name="modoMontagem"]:checked')?.value === 'manual';
+      if(modoManual){
+        renderOrdemManual(serieId, contextoId, modalidadeId, categoria, alunos);
+      } else {
+        previewSorteio = { alunos: DB.embaralharFisherYates(alunos), disputaTerceiro:false, manual:false };
+        renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
+      }
       document.getElementById('areaSorteio').scrollIntoView({ behavior:'smooth' });
     });
   }
+}
+
+// ✍️ Definir manualmente: o professor escolhe a ORDEM dos participantes
+// (setas ↑/↓) em vez de sortear. A lista final alimenta o MESMO preview/
+// confirmação de sempre (renderPreviewSorteio), só sem a opção de
+// "sortear novamente" -- a ordem escolhida é respeitada tal como está.
+function renderOrdemManual(serieId, contextoId, modalidadeId, categoria, alunos){
+  const area = document.getElementById('areaSorteio');
+  if(!area) return;
+  let ordem = alunos.slice();
+
+  function desenhar(){
+    area.innerHTML = `
+      <div class="bloco">
+        <h3>✍️ Defina a ordem dos participantes</h3>
+        <p style="font-size:12.5px; color:var(--texto-suave); margin:-4px 0 10px;">Use as setas para reordenar. O chaveamento será montado respeitando esta ordem, sem sorteio.</p>
+        ${ordem.map((a, i) => `
+          <div class="linha-participante-chave">
+            <span style="font-weight:600;">${i + 1}. ${a.nome}</span>
+            <div style="display:flex; gap:6px;">
+              <button type="button" class="botao-texto" data-acao="mover-cima" data-idx="${i}" ${i === 0 ? 'disabled' : ''} style="min-width:36px;">↑</button>
+              <button type="button" class="botao-texto" data-acao="mover-baixo" data-idx="${i}" ${i === ordem.length - 1 ? 'disabled' : ''} style="min-width:36px;">↓</button>
+            </div>
+          </div>
+        `).join('')}
+        <button class="botao botao-primario" id="btnConfirmarOrdemManual" type="button" style="width:100%; margin-top:12px;">Confirmar ordem e continuar</button>
+      </div>
+    `;
+    area.querySelectorAll('button[data-acao="mover-cima"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.idx);
+        [ordem[i - 1], ordem[i]] = [ordem[i], ordem[i - 1]];
+        desenhar();
+      });
+    });
+    area.querySelectorAll('button[data-acao="mover-baixo"]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.idx);
+        [ordem[i + 1], ordem[i]] = [ordem[i], ordem[i + 1]];
+        desenhar();
+      });
+    });
+    document.getElementById('btnConfirmarOrdemManual').addEventListener('click', () => {
+      previewSorteio = { alunos: ordem.slice(), disputaTerceiro:false, manual:true };
+      renderPreviewSorteio(serieId, contextoId, modalidadeId, categoria);
+    });
+  }
+  desenhar();
 }
 
 /* ---------- Detalhe do chaveamento (bracket) ---------- */
@@ -8099,6 +8327,34 @@ function htmlResumoFamiliaChaveamento(raizId, chaveamentoAtualId){
   `;
 }
 
+// Classificados para o JIBA (novo): não mexe no motor -- só lê
+// DB.classificadosChaveamento (derivado de campeão/vice/terceiro/fase de
+// eliminação, já existentes) e grava a quantidade escolhida.
+function htmlClassificadosChaveamento(raizId){
+  const r = DB.classificadosChaveamento(raizId);
+  const totalParticipantes = r.classificacao.length;
+  if(!totalParticipantes) return '';
+  return `
+    <div class="bloco no-print">
+      <h3 style="margin-bottom:8px;">🏅 Quantidade de classificados</h3>
+      <p style="font-size:12.5px; color:var(--texto-suave); margin:-2px 0 10px;">Escolha quantos dos primeiros colocados serão considerados classificados para o JIBA. A ordem é definida automaticamente pela classificação final.</p>
+      <select id="quantidadeClassificadosSelect" style="width:100%; padding:10px; border-radius:var(--raio); border:1px solid var(--borda); font-size:14px;">
+        <option value="0" ${r.quantidade === 0 ? 'selected' : ''}>— Não definido —</option>
+        ${Array.from({ length: totalParticipantes }, (_, i) => i + 1).map(n => `<option value="${n}" ${r.quantidade === n ? 'selected' : ''}>${n}</option>`).join('')}
+      </select>
+      <button class="botao botao-primario" id="btnSalvarQuantidadeClassificados" type="button" style="width:100%; margin-top:10px;">Salvar</button>
+    </div>
+    ${r.classificados.length ? `
+      <div class="bloco">
+        <h3 style="margin-bottom:8px;">🏅 Classificados (${r.classificados.length})</h3>
+        <ol class="lista-classificados">
+          ${r.classificados.map(item => `<li>${item.aluno.nome}</li>`).join('')}
+        </ol>
+      </div>
+    ` : ''}
+  `;
+}
+
 function telaChaveamentoDetalhe(chaveamentoId){
   const c = DB.getChaveamento(chaveamentoId);
   if(!c){
@@ -8152,7 +8408,8 @@ function telaChaveamentoDetalhe(chaveamentoId){
       <div class="podio-chaveamento">
         <div class="medalha-grande">🏆</div>
         <div class="nome-campeao">${DB.getAluno(c.campeaoAlunoId)?.nome || '—'}</div>
-        <div class="selo-representante">${tipoAtual === 'repescagem' ? 'CAMPEÃO DA REPESCAGEM' : (familia.final ? 'CAMPEÃO DA FASE PRINCIPAL' : `⭐ REPRESENTANTE ${rotuloContextoChaveamento(c).toUpperCase()}`)}</div>
+        <div class="selo-representante">${c.participanteUnico ? '👤 PARTICIPANTE ÚNICO — CAMPEÃO AUTOMÁTICO' : (tipoAtual === 'repescagem' ? 'CAMPEÃO DA REPESCAGEM' : (familia.final ? 'CAMPEÃO DA FASE PRINCIPAL' : `⭐ REPRESENTANTE ${rotuloContextoChaveamento(c).toUpperCase()}`))}</div>
+        ${c.participanteUnico ? '<p style="font-size:12px; color:var(--texto-suave); margin-top:8px;">Apenas 1 aluno inscrito nesta seletiva — não houve partida a disputar.</p>' : ''}
         ${c.viceAlunoId ? `<div class="podio-vice">🥈 Vice-campeão: ${DB.getAluno(c.viceAlunoId)?.nome || '—'}</div>` : ''}
         ${c.terceiroAlunoId ? `<div class="podio-vice">🥉 3º lugar: ${DB.getAluno(c.terceiroAlunoId)?.nome || '—'}</div>` : ''}
       </div>
@@ -8166,29 +8423,33 @@ function telaChaveamentoDetalhe(chaveamentoId){
       <div id="areaAtualizarSeletiva"></div>
     ` : ''}
 
-    <div class="faixa-fase ${tipoAtual}">
-      <span class="ponto-fase"></span>
-      <span>${rotuloFase.replace(/^[^\s]+\s/, '')}</span>
-    </div>
-    <div id="areaBracket">
-      <div class="trilho-chave">
-        ${fases.map(fi => {
-          const confrontosFase = confrontos.filter(x => x.faseIndex === fi && !x.terceiroLugar).sort((a, b) => a.ordem - b.ordem);
-          return `
-            <div class="cartao-fase">
-              <h4>${confrontosFase[0].fase}</h4>
-              ${confrontosFase.map(cf => cardConfrontoChaveHtml(cf)).join('')}
-            </div>
-          `;
-        }).join('')}
-        ${terceiroLugarConfronto ? `
-          <div class="cartao-fase">
-            <h4>🥉 Disputa de 3º lugar</h4>
-            ${cardConfrontoChaveHtml(terceiroLugarConfronto)}
-          </div>
-        ` : ''}
+    ${mostrarAtualizarSeletiva && raizId ? htmlClassificadosChaveamento(raizId) : ''}
+
+    ${!confrontos.length ? '' : `
+      <div class="faixa-fase ${tipoAtual}">
+        <span class="ponto-fase"></span>
+        <span>${rotuloFase.replace(/^[^\s]+\s/, '')}</span>
       </div>
-    </div>
+      <div id="areaBracket">
+        <div class="trilho-chave">
+          ${fases.map(fi => {
+            const confrontosFase = confrontos.filter(x => x.faseIndex === fi && !x.terceiroLugar).sort((a, b) => a.ordem - b.ordem);
+            return `
+              <div class="cartao-fase">
+                <h4>${confrontosFase[0].fase}</h4>
+                ${confrontosFase.map(cf => cardConfrontoChaveHtml(cf)).join('')}
+              </div>
+            `;
+          }).join('')}
+          ${terceiroLugarConfronto ? `
+            <div class="cartao-fase">
+              <h4>🥉 Disputa de 3º lugar</h4>
+              ${cardConfrontoChaveHtml(terceiroLugarConfronto)}
+            </div>
+          ` : ''}
+        </div>
+      </div>
+    `}
   `;
 }
 
@@ -8540,6 +8801,21 @@ function ligarEventosChaveamentoDetalhe(chaveamentoId){
   const btnAtualizarSeletiva = document.getElementById('btnAtualizarSeletiva');
   if(btnAtualizarSeletiva){
     btnAtualizarSeletiva.addEventListener('click', () => renderAreaAtualizarSeletiva(chaveamentoId));
+  }
+
+  const btnSalvarQuantidadeClassificados = document.getElementById('btnSalvarQuantidadeClassificados');
+  if(btnSalvarQuantidadeClassificados){
+    btnSalvarQuantidadeClassificados.addEventListener('click', () => {
+      const cAtual = DB.getChaveamento(chaveamentoId);
+      const tipoAtualLocal = cAtual.tipo || 'principal';
+      const raizIdLocal = tipoAtualLocal === 'principal' ? cAtual.id : cAtual.chaveamentoPrincipalId;
+      const definitivoId = DB.classificadosChaveamento(raizIdLocal).definitivoId;
+      if(!definitivoId) return;
+      const quantidade = Number(document.getElementById('quantidadeClassificadosSelect').value);
+      DB.definirQuantidadeClassificados(definitivoId, quantidade);
+      mostrarToast(quantidade > 0 ? `${quantidade} classificado(s) definido(s).` : 'Quantidade removida.');
+      rerenderizarChaveamentoDetalhe(chaveamentoId);
+    });
   }
 
   // Etapa 2B-3: gerar repescagem/final -- reaproveita DB.montarChaveamento
@@ -9816,6 +10092,16 @@ function blocoChaveamentoRelatorio(chaveamento, tituloSecao, rotuloCampeao){
   const fases = [...new Set(confrontos.filter(c => !c.terceiroLugar).map(c => c.faseIndex))].sort((a, b) => a - b);
   const terceiro = confrontos.find(c => c.terceiroLugar);
 
+  if(chaveamento.participanteUnico){
+    return `
+      <div class="secao-relatorio">
+        ${tituloSecao ? `<div class="rotulo-secao-chaveamento">${tituloSecao}</div>` : ''}
+        <p style="font-size:12.5px; color:var(--texto-suave); margin:0 0 8px;">Apenas 1 participante inscrito nesta seletiva — sem confronto a registrar.</p>
+        <div class="linha-relatorio"><span class="selo-medalha-relatorio">🥇 ${rotuloCampeao || 'Campeão'} (participante único)</span><span>${DB.getAluno(chaveamento.campeaoAlunoId)?.nome || '—'}</span></div>
+      </div>
+    `;
+  }
+
   return `
     ${fases.map((fi, idx) => {
       const confrontosFase = confrontos.filter(c => c.faseIndex === fi && !c.terceiroLugar).sort((a, b) => a.ordem - b.ordem);
@@ -9852,6 +10138,25 @@ function conteudoRelatorioChaveamento(chaveamento){
     ${blocoChaveamentoRelatorio(principal, temFamilia ? '🏆 FASE PRINCIPAL' : null, temFamilia ? 'Campeão da Fase Principal' : 'Campeão')}
     ${familia.repescagem ? blocoChaveamentoRelatorio(familia.repescagem, '🔄 REPESCAGEM', 'Campeão da Repescagem') : ''}
     ${familia.final ? blocoChaveamentoRelatorio(familia.final, '🥇 FINAL', 'CAMPEÃO DA MODALIDADE') : ''}
+    ${blocoClassificadosRelatorio(raizId, modalidade)}
+  `;
+}
+// Classificados para o JIBA (novo): mostra só modalidade + nomes, sem
+// colocação/turma/resultado -- reaproveita o mesmo CSS (.secao-relatorio,
+// .lista-classificados) já usado no relatório "Alunos Classificados",
+// sem nenhum redesenho.
+function blocoClassificadosRelatorio(raizId, modalidade){
+  if(!raizId) return '';
+  const r = DB.classificadosChaveamento(raizId);
+  if(!r.classificados.length) return '';
+  return `
+    <div class="secao-relatorio">
+      <h3>🏅 CLASSIFICADOS PARA O JIBA</h3>
+      <div style="font-size:13.5px; font-weight:700; margin-bottom:6px;">${iconeModalidade(modalidade ? modalidade.nome : '')} ${modalidade ? modalidade.nome : ''}</div>
+      <ol class="lista-classificados">
+        ${r.classificados.map(item => `<li>${item.aluno.nome}</li>`).join('')}
+      </ol>
+    </div>
   `;
 }
 function telaRelatorioChaveamento(serieId, turmaId, modalidadeId, categoria){
