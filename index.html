@@ -318,9 +318,23 @@
     padding: 14px; margin-bottom: 10px;
   }
   .cartao-aluno .topo-aluno{ display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+  .checkbox-selecao-aluno{ display:flex; align-items:center; padding-top:2px; }
+  .checkbox-selecao-aluno input{ width:20px; height:20px; }
   .cartao-aluno .nome-aluno{ font-size: 15.5px; font-weight:600; }
   .cartao-aluno .meta-aluno{ font-size:12.5px; color: var(--texto-suave); margin-top:2px; }
   .cartao-aluno .resumo-aluno{ font-size:12.5px; color: var(--verde-campo); font-weight:600; margin-top:4px; }
+  .linha-selecionar-todos{ margin: 10px 0 6px; }
+  .barra-acao-massa{
+    position:sticky; top:6px; z-index:5; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+    gap:10px; background: var(--azul-quadra); color:#fff; border-radius: var(--raio); padding:10px 12px; margin-bottom:12px;
+  }
+  .contagem-selecionados{ font-size:13px; font-weight:700; }
+  .botoes-acao-massa{ display:flex; gap:8px; flex-wrap:wrap; }
+  .botoes-acao-massa button{
+    padding:9px 12px; border-radius:var(--raio); border:1px solid rgba(255,255,255,0.4); background:rgba(255,255,255,0.12);
+    color:#fff; font-weight:700; font-size:12.5px; min-height:38px;
+  }
+  .botoes-acao-massa button:disabled{ opacity:0.6; }
   .cartao-aluno .acoes-aluno{
     display:flex; gap: 14px; margin-top:10px; padding-top:10px; border-top:1px solid var(--borda);
   }
@@ -4760,6 +4774,21 @@ function telaFichaTurma(turmaId){
         <input type="text" id="buscaAluno" placeholder="Digite o nome do aluno...">
       </div>
 
+      <div class="linha-selecionar-todos">
+        <label class="rotulo-falta">
+          <input type="checkbox" id="checkSelecionarTodosAlunos">
+          <span>Selecionar todos</span>
+        </label>
+      </div>
+      <div id="barraAcaoMassaSexo" class="barra-acao-massa" style="display:none;">
+        <div class="contagem-selecionados" id="contagemSelecionadosAlunos"></div>
+        <div class="botoes-acao-massa">
+          <button type="button" class="botao botao-secundario" data-acao="massa-sexo" data-sexo="Masculino">♂ Masculino</button>
+          <button type="button" class="botao botao-secundario" data-acao="massa-sexo" data-sexo="Feminino">♀ Feminino</button>
+          <button type="button" class="botao botao-secundario" data-acao="massa-sexo" data-sexo="Não informado">⚪ Não informado</button>
+        </div>
+      </div>
+
       <div id="listaAlunosTurma"></div>
     </div>
 
@@ -4798,6 +4827,8 @@ function renderResumoTurma(turmaId){
   if(elInscricoes) elInscricoes.textContent = totalInscricoes;
 }
 
+let alunosSelecionadosMassa = new Set(); // seleção em massa (sexo) na Ficha da Turma -- limpa ao trocar de turma/sair
+
 function renderListaAlunosTurma(turmaId){
   const container = document.getElementById('listaAlunosTurma');
   if(!container) return;
@@ -4808,10 +4839,15 @@ function renderListaAlunosTurma(turmaId){
   }
   alunos.sort((a,b) => a.nome.localeCompare(b.nome, 'pt-BR'));
 
+  // segurança: nunca manter selecionado um aluno que não existe mais nesta turma
+  const idsValidos = new Set(DB.getAlunosPorTurma(turmaId).map(a => a.id));
+  Array.from(alunosSelecionadosMassa).forEach(id => { if(!idsValidos.has(id)) alunosSelecionadosMassa.delete(id); });
+
   if(!alunos.length){
     container.innerHTML = `<p style="color:var(--texto-suave); font-size:14px; text-align:center; padding:20px 0;">
       ${termoBusca ? 'Nenhum aluno encontrado.' : 'Nenhum aluno cadastrado nesta turma ainda.'}
     </p>`;
+    atualizarBarraAcaoMassaSexo(alunos);
     return;
   }
 
@@ -4820,7 +4856,10 @@ function renderListaAlunosTurma(turmaId){
     return `
       <div class="cartao-aluno" data-id="${a.id}">
         <div class="topo-aluno">
-          <div>
+          <label class="checkbox-selecao-aluno">
+            <input type="checkbox" class="check-selecao-aluno" data-id="${a.id}" ${alunosSelecionadosMassa.has(a.id) ? 'checked' : ''}>
+          </label>
+          <div style="flex:1;">
             <div class="nome-aluno">${a.nome}</div>
             <div class="meta-aluno">
               <select class="seletor-sexo-cartao" data-acao="alterar-sexo" data-id="${a.id}">
@@ -4840,6 +4879,31 @@ function renderListaAlunosTurma(turmaId){
       </div>
     `;
   }).join('');
+
+  atualizarBarraAcaoMassaSexo(alunos);
+}
+
+// Seleção em massa (sexo) -- atualiza a caixa "Selecionar todos" e a
+// barra de ação conforme os alunos ATUALMENTE exibidos (busca aplicada).
+function atualizarBarraAcaoMassaSexo(alunosExibidos){
+  const checkTodos = document.getElementById('checkSelecionarTodosAlunos');
+  const barra = document.getElementById('barraAcaoMassaSexo');
+  const contagem = document.getElementById('contagemSelecionadosAlunos');
+  if(!checkTodos || !barra || !contagem) return;
+
+  const idsExibidos = alunosExibidos.map(a => a.id);
+  const selecionadosExibidos = idsExibidos.filter(id => alunosSelecionadosMassa.has(id));
+
+  checkTodos.checked = idsExibidos.length > 0 && selecionadosExibidos.length === idsExibidos.length;
+  checkTodos.indeterminate = selecionadosExibidos.length > 0 && selecionadosExibidos.length < idsExibidos.length;
+
+  const total = alunosSelecionadosMassa.size;
+  if(total > 0){
+    barra.style.display = 'flex';
+    contagem.textContent = `${total} aluno${total > 1 ? 's' : ''} selecionado${total > 1 ? 's' : ''}`;
+  } else {
+    barra.style.display = 'none';
+  }
 }
 
 function iconeTipoModalidade(tipo){ return tipo === 'Coletiva' ? '🏃' : '🏅'; }
@@ -5007,6 +5071,7 @@ function renderListaModalidadesTurma(turmaId){
 function ligarEventosFichaTurma(turmaId){
   const turma = DB.getTurmas().find(t => t.id === turmaId);
   const serieId = turma ? turma.serieId : null;
+  alunosSelecionadosMassa = new Set(); // limpa a seleção em massa ao entrar/trocar de turma
 
   document.getElementById('formNovoAluno').addEventListener('submit', async e => {
     e.preventDefault();
@@ -5061,6 +5126,16 @@ function ligarEventosFichaTurma(turmaId){
   });
 
   document.getElementById('listaAlunosTurma').addEventListener('change', async e => {
+    const check = e.target.closest('input.check-selecao-aluno');
+    if(check){
+      if(check.checked) alunosSelecionadosMassa.add(check.dataset.id);
+      else alunosSelecionadosMassa.delete(check.dataset.id);
+      const termoBusca = (document.getElementById('buscaAluno')?.value || '').trim().toLowerCase();
+      let alunosExibidos = DB.getAlunosPorTurma(turmaId);
+      if(termoBusca) alunosExibidos = alunosExibidos.filter(a => a.nome.toLowerCase().includes(termoBusca));
+      atualizarBarraAcaoMassaSexo(alunosExibidos);
+      return;
+    }
     const sel = e.target.closest('select[data-acao="alterar-sexo"]');
     if(!sel) return;
     const id = sel.dataset.id;
@@ -5076,6 +5151,39 @@ function ligarEventosFichaTurma(turmaId){
       sel.value = anterior;
     } finally {
       sel.disabled = false;
+    }
+  });
+
+  document.getElementById('checkSelecionarTodosAlunos').addEventListener('change', e => {
+    const termoBusca = (document.getElementById('buscaAluno')?.value || '').trim().toLowerCase();
+    let alunosExibidos = DB.getAlunosPorTurma(turmaId);
+    if(termoBusca) alunosExibidos = alunosExibidos.filter(a => a.nome.toLowerCase().includes(termoBusca));
+    if(e.target.checked) alunosExibidos.forEach(a => alunosSelecionadosMassa.add(a.id));
+    else alunosExibidos.forEach(a => alunosSelecionadosMassa.delete(a.id));
+    renderListaAlunosTurma(turmaId);
+  });
+
+  document.getElementById('barraAcaoMassaSexo').addEventListener('click', async e => {
+    const btn = e.target.closest('button[data-acao="massa-sexo"]');
+    if(!btn) return;
+    const novoSexo = btn.dataset.sexo;
+    const ids = Array.from(alunosSelecionadosMassa);
+    if(!ids.length) return;
+    if(!confirm(`Definir ${novoSexo} para ${ids.length} aluno${ids.length > 1 ? 's' : ''} selecionado${ids.length > 1 ? 's' : ''}?`)) return;
+    document.querySelectorAll('#barraAcaoMassaSexo button').forEach(b => b.disabled = true);
+    try {
+      for(const id of ids){
+        await DB.atualizarAluno(id, { sexo: novoSexo });
+      }
+      alunosSelecionadosMassa.clear();
+      mostrarToast('Sexo atualizado em massa.');
+      renderListaAlunosTurma(turmaId);
+    } catch(err){
+      console.error('Erro ao atualizar sexo em massa:', err);
+      alert('Não foi possível salvar para todos os alunos. Verifique sua conexão e tente novamente.');
+      renderListaAlunosTurma(turmaId);
+    } finally {
+      document.querySelectorAll('#barraAcaoMassaSexo button').forEach(b => b.disabled = false);
     }
   });
 
