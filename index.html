@@ -1419,7 +1419,8 @@ const DB = (() => {
     confrontosChaveamento: 'jiba_confrontos_chaveamento',
     finaisJiba: 'jiba_finais_jiba',
     participantesFinalJiba: 'jiba_participantes_final_jiba',
-    confrontosFinalJiba: 'jiba_confrontos_final_jiba'
+    confrontosFinalJiba: 'jiba_confrontos_final_jiba',
+    jogadoresPorGrupoModalidade: 'jiba_jogadores_por_grupo_modalidade'
   };
 
   function lerLista(chave){
@@ -2087,6 +2088,64 @@ const DB = (() => {
     };
   }
 
+  // MODALIDADES COLETIVAS do mesmo contexto (turma ou agrupamento) --
+  // usado só na impressão combinada (Bloco 12). CORREÇÃO: agora existe
+  // "equipe do agrupamento" (DB.obterOuCriarEquipePorContexto) -- quando
+  // o contexto é um agrupamento e há uma equipe DELE (não de uma turma
+  // isolada) para a modalidade, mostra essa organização combinada, com
+  // a identificação do agrupamento (não de uma turma). Nunca mistura com
+  // os classificados de seletiva (função acima), fonte de dados
+  // totalmente diferente.
+  function relatorioColetivasContexto(idTurmaOuAgrupamento){
+    const ctx = contextoApresentacaoResultado(idTurmaOuAgrupamento);
+    if(!ctx) return [];
+    const resultado = [];
+
+    if(ctx.tipo === 'grupo'){
+      const modalidadesJaMostradas = new Set();
+      const modalidadesPossiveis = [...new Set(ctx.turmas.flatMap(t => modalidadesColetivasDaSerie(t.serieId).map(m => m.id)))]
+        .map(id => getModalidades().find(m => m.id === id)).filter(Boolean);
+      modalidadesPossiveis.forEach(m => {
+        const equipeAgrupamento = getEquipePorContexto(idTurmaOuAgrupamento, m.id);
+        if(!equipeAgrupamento) return;
+        const categorias = resumoGruposEquipePorCategoria(equipeAgrupamento.id);
+        if(!categorias.length) return;
+        resultado.push({ turma: null, agrupamento: ctx.agrupamento, modalidade: m, categorias });
+        modalidadesJaMostradas.add(m.id);
+      });
+      // turmas que ainda não têm uma equipe DO AGRUPAMENTO para essa
+      // modalidade continuam mostrando a organização individual delas
+      // (comportamento já existente, preservado)
+      ctx.turmas.forEach(turma => {
+        modalidadesColetivasDaSerie(turma.serieId).forEach(m => {
+          if(modalidadesJaMostradas.has(m.id)) return;
+          const inscritos = getAlunosInscritosModalidade(turma.id, m.id);
+          if(!inscritos.length) return;
+          const equipe = getEquipe(turma.id, m.id);
+          if(!equipe) return;
+          const categorias = resumoGruposEquipePorCategoria(equipe.id);
+          if(!categorias.length) return;
+          resultado.push({ turma, agrupamento: null, modalidade: m, categorias });
+        });
+      });
+      return resultado;
+    }
+
+    ctx.turmas.forEach(turma => {
+      const modalidades = modalidadesColetivasDaSerie(turma.serieId);
+      modalidades.forEach(m => {
+        const inscritos = getAlunosInscritosModalidade(turma.id, m.id);
+        if(!inscritos.length) return;
+        const equipe = getEquipe(turma.id, m.id);
+        if(!equipe) return;
+        const categorias = resumoGruposEquipePorCategoria(equipe.id);
+        if(!categorias.length) return;
+        resultado.push({ turma, agrupamento: null, modalidade: m, categorias });
+      });
+    });
+    return resultado;
+  }
+
   // RESULTADO DETALHADO (controle interno): todas as participações
   // (qualquer situação, inclusive Aguardando/Reserva), com sexo, turma
   // de origem, presença e colocação -- para conferência do organizador.
@@ -2160,6 +2219,28 @@ const DB = (() => {
     return alunos;
   }
 
+  // Correção (Equipes/Grupos + Agrupamento): mesma ideia de
+  // alunosElegiveisChaveamentoContexto/contextoApresentacaoResultado, já
+  // usadas em Chaveamentos e Relatórios -- reaproveita DB.getAgrupamento
+  // (a mesma estrutura de agrupamento já existente, nada paralelo). Turma
+  // individual: comportamento de sempre. Agrupamento: reúne os elegíveis
+  // de TODAS as turmas do grupo, sem duplicar (cada aluno só tem uma
+  // turma de origem, então não há como aparecer 2x por engano).
+  function alunosElegiveisEquipePorContexto(idTurmaOuAgrupamento, modalidadeId){
+    const agrupamento = getAgrupamento(idTurmaOuAgrupamento);
+    if(agrupamento){
+      const vistos = new Set();
+      const resultado = [];
+      agrupamento.turmaIds.forEach(tid => {
+        alunosElegiveisEquipe(tid, modalidadeId).forEach(a => {
+          if(!vistos.has(a.id)){ vistos.add(a.id); resultado.push(a); }
+        });
+      });
+      return resultado;
+    }
+    return alunosElegiveisEquipe(idTurmaOuAgrupamento, modalidadeId);
+  }
+
   function getEquipes(){ return lerLista(CHAVES.equipes); }
   function getEquipe(turmaId, modalidadeId){
     return getEquipes().find(e => e.turmaId === turmaId && e.modalidadeId === modalidadeId) || null;
@@ -2170,6 +2251,34 @@ const DB = (() => {
     const lista = getEquipes();
     equipe = {
       id: gerarId(), turmaId, modalidadeId, status: 'Em montagem',
+      limiteSelecionados: 0, limiteReservas: 0,
+      regraMista: { ativa:false, minMeninos:0, minMeninas:0 }
+    };
+    lista.push(equipe);
+    salvarLista(CHAVES.equipes, lista);
+    return equipe;
+  }
+  // Equivalentes de getEquipe/obterOuCriarEquipe, mas aceitando também
+  // um agrupamento como contexto -- mesmo padrão usado em
+  // DB.montarChaveamento (turmaId fica null, agrupamentoId é gravado no
+  // lugar). NÃO substitui getEquipe/obterOuCriarEquipe (que continuam
+  // exatamente iguais para a tela tradicional por turma) -- é uma opção
+  // a mais, usada só onde o contexto pode ser turma OU agrupamento.
+  function getEquipePorContexto(idTurmaOuAgrupamento, modalidadeId){
+    const agrupamento = getAgrupamento(idTurmaOuAgrupamento);
+    if(agrupamento){
+      return getEquipes().find(e => e.agrupamentoId === idTurmaOuAgrupamento && e.modalidadeId === modalidadeId) || null;
+    }
+    return getEquipe(idTurmaOuAgrupamento, modalidadeId);
+  }
+  function obterOuCriarEquipePorContexto(idTurmaOuAgrupamento, modalidadeId){
+    const equipeExistente = getEquipePorContexto(idTurmaOuAgrupamento, modalidadeId);
+    if(equipeExistente) return equipeExistente;
+    const agrupamento = getAgrupamento(idTurmaOuAgrupamento);
+    if(!agrupamento) return obterOuCriarEquipe(idTurmaOuAgrupamento, modalidadeId);
+    const lista = getEquipes();
+    const equipe = {
+      id: gerarId(), turmaId: null, agrupamentoId: idTurmaOuAgrupamento, modalidadeId, status: 'Em montagem',
       limiteSelecionados: 0, limiteReservas: 0,
       regraMista: { ativa:false, minMeninos:0, minMeninas:0 }
     };
@@ -2233,6 +2342,218 @@ const DB = (() => {
       const reservas = participacoes.filter(p => p.status === 'Reserva').length;
       return { modalidade: m, inscritos, selecionados, reservas, equipe };
     }).filter(r => r.inscritos > 0);
+  }
+
+  /* ============================================================
+     GRUPOS DENTRO DA EQUIPE (rodada anterior + categoria, agora)
+     ------------------------------------------------------------
+     Mesma estrutura de antes (`equipe.grupos`, `participacaoEquipe.
+     grupoIds`) -- só ganhou um campo a mais por grupo: `categoria`
+     ('Masculino'|'Feminino'|'Misto'). Cada categoria tem sua própria
+     numeração/lista de grupos, independente das outras. Grupos
+     antigos (de antes desta atualização, sem `categoria`) são tratados
+     como 'Misto' para não quebrar nada que já existia.
+  ============================================================ */
+  function normalizarCategoriaGrupo(categoria){
+    return ['Masculino', 'Feminino', 'Misto'].includes(categoria) ? categoria : 'Misto';
+  }
+  function getGruposEquipe(equipeId, categoria){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    const grupos = (equipe ? (equipe.grupos || []) : []).map(g => ({ ...g, categoria: normalizarCategoriaGrupo(g.categoria) }));
+    return categoria ? grupos.filter(g => g.categoria === categoria) : grupos;
+  }
+  function criarGrupoEquipe(equipeId, nome, categoria){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    if(!equipe) throw new Error('Equipe não encontrada.');
+    if(!nome || !nome.trim()) throw new Error('Informe um nome para o grupo.');
+    const grupos = equipe.grupos || [];
+    const novoGrupo = { id: gerarId(), nome: nome.trim(), categoria: normalizarCategoriaGrupo(categoria) };
+    atualizarEquipe(equipeId, { grupos: [...grupos, novoGrupo] });
+    return novoGrupo;
+  }
+  function renomearGrupoEquipe(equipeId, grupoId, novoNome){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    if(!equipe) throw new Error('Equipe não encontrada.');
+    if(!novoNome || !novoNome.trim()) throw new Error('Informe um nome para o grupo.');
+    const grupos = (equipe.grupos || []).map(g => g.id === grupoId ? { ...g, nome: novoNome.trim() } : g);
+    atualizarEquipe(equipeId, { grupos });
+  }
+  function excluirGrupoEquipe(equipeId, grupoId){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    if(!equipe) throw new Error('Equipe não encontrada.');
+    const grupos = (equipe.grupos || []).filter(g => g.id !== grupoId);
+    atualizarEquipe(equipeId, { grupos });
+    // tira a referência desse grupo das participações (não apaga a
+    // participação nem a inscrição original do aluno)
+    const participacoes = lerLista(CHAVES.participacoesEquipe).map(p =>
+      p.equipeId === equipeId ? { ...p, grupoIds: (p.grupoIds || []).filter(id => id !== grupoId) } : p
+    );
+    salvarLista(CHAVES.participacoesEquipe, participacoes);
+  }
+  // Um aluno PODE estar em vários grupos ao mesmo tempo -- não há
+  // exclusividade nenhuma aqui, de propósito.
+  function adicionarAlunoAoGrupoEquipe(equipeId, alunoId, grupoId){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    if(!equipe || !(equipe.grupos || []).some(g => g.id === grupoId)) throw new Error('Grupo não encontrado.');
+    const participacao = obterOuCriarParticipacaoEquipe(equipeId, alunoId);
+    const grupoIds = participacao.grupoIds || [];
+    if(!grupoIds.includes(grupoId)) atualizarParticipacaoEquipe(participacao.id, { grupoIds: [...grupoIds, grupoId] });
+  }
+  function removerAlunoDoGrupoEquipe(equipeId, alunoId, grupoId){
+    const participacao = getParticipacoesEquipe(equipeId).find(p => p.alunoId === alunoId);
+    if(!participacao) return;
+    atualizarParticipacaoEquipe(participacao.id, { grupoIds: (participacao.grupoIds || []).filter(id => id !== grupoId) });
+  }
+  function getAlunosDoGrupoEquipe(equipeId, grupoId){
+    return getParticipacoesEquipe(equipeId)
+      .filter(p => (p.grupoIds || []).includes(grupoId))
+      .map(p => getAluno(p.alunoId))
+      .filter(Boolean);
+  }
+  // Prévia/relatório (mantido, agora com categoria em cada grupo): cada
+  // grupo com seus alunos -- um aluno aparece em todos os grupos aos
+  // quais pertence (duplicação legítima, não é erro). Só leitura.
+  function resumoGruposEquipe(equipeId){
+    return getGruposEquipe(equipeId).map(g => ({ grupo: g, alunos: getAlunosDoGrupoEquipe(equipeId, g.id) }));
+  }
+  // Igual ao de cima, mas organizado por categoria (Masculino/Feminino/
+  // Misto, nessa ordem) -- usado pela impressão. Uma categoria só entra
+  // na lista se tiver pelo menos um grupo com pelo menos um aluno
+  // (categoria sem grupo, ou só com grupos vazios, simplesmente não
+  // aparece -- sem precisar de uma regra à parte para "grupo vazio").
+  function resumoGruposEquipePorCategoria(equipeId){
+    const grupos = getGruposEquipe(equipeId);
+    return ['Masculino', 'Feminino', 'Misto']
+      .map(categoria => ({
+        categoria,
+        grupos: grupos
+          .filter(g => g.categoria === categoria)
+          .map(g => ({ grupo: g, alunos: getAlunosDoGrupoEquipe(equipeId, g.id) }))
+          .filter(item => item.alunos.length > 0)
+      }))
+      .filter(c => c.grupos.length > 0);
+  }
+  // Elegíveis para grupos, já filtrados pela categoria do GRUPO (não a
+  // categoria da modalidade -- são conceitos diferentes: a modalidade
+  // pode ser Mista e ainda assim ter grupos separados por sexo).
+  // Masculino/Feminino filtram por aluno.sexo; Misto usa todos os
+  // elegíveis da modalidade normalmente.
+  function alunosElegiveisEquipePorCategoria(idTurmaOuAgrupamento, modalidadeId, categoria){
+    const elegiveis = alunosElegiveisEquipePorContexto(idTurmaOuAgrupamento, modalidadeId);
+    if(categoria === 'Masculino') return elegiveis.filter(a => a.sexo === 'Masculino');
+    if(categoria === 'Feminino') return elegiveis.filter(a => a.sexo === 'Feminino');
+    return elegiveis;
+  }
+  // Distribuição automática (ação explícita): cria N grupos novos DA
+  // CATEGORIA escolhida, substituindo só os grupos JÁ existentes dessa
+  // MESMA categoria (os de outras categorias continuam intactos) e
+  // distribui os elegíveis dessa categoria entre eles (round-robin).
+  // Ajustes manuais depois continuam funcionando normalmente.
+  // Distribuição automática (ação explícita): cria N grupos novos DA
+  // CATEGORIA escolhida, substituindo só os grupos JÁ existentes dessa
+  // MESMA categoria (os de outras categorias continuam intactos).
+  //
+  // CORREÇÃO: `jogadoresPorGrupo` agora é tratado como quantidade de
+  // VAGAS por grupo (antes era só uma referência ignorada na hora de
+  // distribuir, o que produzia resultados como 6+2 em vez de 4+4 ou
+  // 5+5 pedidos). O preenchimento acontece em duas fases:
+  //   1) cada aluno único entra em UM grupo (rodízio), sem repetir
+  //      ninguém, até a capacidade de cada grupo ou até acabarem os
+  //      alunos;
+  //   2) só se ainda sobrar vaga (não há alunos únicos suficientes),
+  //      repete alunos já usados para completar -- nunca repete o
+  //      MESMO aluno dentro do MESMO grupo (isso não faria sentido:
+  //      um aluno ou está ou não está em cada grupo).
+  // Se a capacidade pedida for maior que o total de alunos elegíveis,
+  // o grupo é preenchido com todos eles (não há como ter mais membros
+  // distintos do que pessoas existem) -- ver LEIA-ME para esse caso.
+  function distribuirAutomaticamenteGrupos(equipeId, quantidadeGrupos, categoria, jogadoresPorGrupo){
+    const equipe = getEquipes().find(e => e.id === equipeId);
+    if(!equipe) throw new Error('Equipe não encontrada.');
+    if(!quantidadeGrupos || quantidadeGrupos < 1) throw new Error('Informe pelo menos 1 grupo.');
+    const categoriaFinal = normalizarCategoriaGrupo(categoria);
+    const alunos = alunosElegiveisEquipePorCategoria(equipe.agrupamentoId || equipe.turmaId, equipe.modalidadeId, categoriaFinal);
+    if(!alunos.length) throw new Error('Nenhum aluno elegível para esta categoria.');
+    const capacidade = (jogadoresPorGrupo && jogadoresPorGrupo > 0)
+      ? jogadoresPorGrupo
+      : Math.ceil(alunos.length / quantidadeGrupos);
+
+    const gruposAtuais = (equipe.grupos || []).map(g => ({ ...g, categoria: normalizarCategoriaGrupo(g.categoria) }));
+    const idsGruposAntigosDestaCategoria = new Set(gruposAtuais.filter(g => g.categoria === categoriaFinal).map(g => g.id));
+    const gruposOutrasCategorias = gruposAtuais.filter(g => g.categoria !== categoriaFinal);
+    const novosGrupos = Array.from({ length: quantidadeGrupos }, (_, i) => ({ id: gerarId(), nome: `Grupo ${i + 1}`, categoria: categoriaFinal }));
+    atualizarEquipe(equipeId, { grupos: [...gruposOutrasCategorias, ...novosGrupos] });
+
+    alunos.forEach(a => obterOuCriarParticipacaoEquipe(equipeId, a.id));
+    if(idsGruposAntigosDestaCategoria.size){
+      const participacoesLimpas = lerLista(CHAVES.participacoesEquipe).map(p =>
+        p.equipeId === equipeId ? { ...p, grupoIds: (p.grupoIds || []).filter(id => !idsGruposAntigosDestaCategoria.has(id)) } : p
+      );
+      salvarLista(CHAVES.participacoesEquipe, participacoesLimpas);
+    }
+
+    // membros[i] = conjunto de ids de aluno já designados pro grupo i
+    const membros = novosGrupos.map(() => new Set());
+
+    // FASE 1: rodízio simples -- cada aluno único vai para UM grupo,
+    // sem repetir ninguém, respeitando a capacidade de cada grupo.
+    const rodada1 = embaralharFisherYates(alunos);
+    let g = 0;
+    for(const aluno of rodada1){
+      let tentativas = 0;
+      while(membros[g].size >= capacidade && tentativas < quantidadeGrupos){
+        g = (g + 1) % quantidadeGrupos;
+        tentativas++;
+      }
+      if(tentativas >= quantidadeGrupos) break; // todos os grupos já atingiram a capacidade
+      membros[g].add(aluno.id);
+      g = (g + 1) % quantidadeGrupos;
+    }
+
+    // FASE 2: repetição -- só entra em ação quando um grupo ainda não
+    // chegou na capacidade (ou seja, não havia alunos únicos
+    // suficientes para preencher todas as vagas na fase 1).
+    for(let i = 0; i < quantidadeGrupos; i++){
+      while(membros[i].size < capacidade && membros[i].size < alunos.length){
+        const disponiveis = alunos.filter(a => !membros[i].has(a.id));
+        const escolhido = embaralharFisherYates(disponiveis)[0];
+        membros[i].add(escolhido.id);
+      }
+      // se membros[i].size === alunos.length e ainda for < capacidade,
+      // não há como preencher mais sem duplicar dentro do MESMO grupo
+      // (todo mundo que existe já está neste grupo) -- para aqui.
+    }
+
+    membros.forEach((idsAlunoDoGrupo, idx) => {
+      const grupo = novosGrupos[idx];
+      idsAlunoDoGrupo.forEach(alunoId => {
+        const p = lerLista(CHAVES.participacoesEquipe).find(x => x.equipeId === equipeId && x.alunoId === alunoId);
+        if(p){
+          const grupoIdsAtuais = p.grupoIds || [];
+          if(!grupoIdsAtuais.includes(grupo.id)){
+            atualizarParticipacaoEquipe(p.id, { grupoIds: [...grupoIdsAtuais, grupo.id] });
+          }
+        }
+      });
+    });
+
+    return novosGrupos;
+  }
+
+  // Quantidade padrão de "jogadores por grupo" (Bloco 7). Guardado em
+  // localStorage (não em `modalidades`, que é tabela do Supabase) --
+  // não há necessidade real de alterar aquele schema só para um valor
+  // de referência/sugestão da distribuição automática, que nem é
+  // obrigatório. Ausente = 5 (padrão genérico razoável, editável).
+  function getJogadoresPorGrupoPadrao(modalidadeId){
+    const registro = lerLista(CHAVES.jogadoresPorGrupoModalidade).find(r => r.modalidadeId === modalidadeId);
+    return registro ? registro.quantidade : 5;
+  }
+  function definirJogadoresPorGrupoPadrao(modalidadeId, quantidade){
+    if(!quantidade || quantidade < 1) throw new Error('Informe uma quantidade válida.');
+    const lista = lerLista(CHAVES.jogadoresPorGrupoModalidade).filter(r => r.modalidadeId !== modalidadeId);
+    lista.push({ modalidadeId, quantidade });
+    salvarLista(CHAVES.jogadoresPorGrupoModalidade, lista);
   }
 
   /* ---------- Jogos / Confrontos / Resultados (Bloco 5) ---------- */
@@ -3746,7 +4067,8 @@ const DB = (() => {
         modalidade: m,
         equipeDefinida: !!equipe,
         titulares, reservas,
-        capitao: capitaoParticipacao ? getAluno(capitaoParticipacao.alunoId) : null
+        capitao: capitaoParticipacao ? getAluno(capitaoParticipacao.alunoId) : null,
+        grupos: equipe ? resumoGruposEquipePorCategoria(equipe.id) : []
       });
     });
     return linhas;
@@ -4003,9 +4325,15 @@ const DB = (() => {
     contarClassificados, resumoSeletivasDaTurma,
     getModalidadesColetivasAtivas, modalidadesColetivasDaSerie, alunosElegiveisEquipe,
     getEquipes, getEquipe, obterOuCriarEquipe, atualizarEquipe,
+    alunosElegiveisEquipePorContexto, getEquipePorContexto, obterOuCriarEquipePorContexto,
     getParticipacoesEquipe, getParticipacoesEquipeDoAluno, obterOuCriarParticipacaoEquipe,
     atualizarParticipacaoEquipe, removerAlunoDaEquipe,
     contarSelecionadosEquipe, contarReservasEquipe, getCapitaoEquipe, resumoEquipesDaTurma,
+    getGruposEquipe, criarGrupoEquipe, renomearGrupoEquipe, excluirGrupoEquipe,
+    adicionarAlunoAoGrupoEquipe, removerAlunoDoGrupoEquipe, getAlunosDoGrupoEquipe,
+    resumoGruposEquipe, distribuirAutomaticamenteGrupos,
+    resumoGruposEquipePorCategoria, alunosElegiveisEquipePorCategoria,
+    getJogadoresPorGrupoPadrao, definirJogadoresPorGrupoPadrao,
     getTurmasAtivasDaSerie,
     getJogos, getJogo, existeConfrontoIdentico, criarJogo, atualizarJogo, excluirJogo,
     calcularResultado, getJogosPorTurma, getJogosPorModalidadeSerie, resumoJogosDaTurma, resumoGeralJogos,
@@ -4047,6 +4375,7 @@ const DB = (() => {
     criarAgrupamento, editarAgrupamento, separarAgrupamento, resumoInscricoesPorAgrupamento,
     contextoApresentacaoResultado, situacaoAmigavelParticipacao,
     relatorioClassificadosSimplificado, relatorioResultadoDetalhado, relatorioCampeoesChaveamentoFinal,
+    relatorioColetivasContexto,
     relatorioInscritosPorModalidade, relatorioResultadosSeletivasDaTurma, relatorioResultadosJiba,
     quadroDeMedalhasJiba, calcularPendencias, resumoGeralRelatorio,
     analisarListaAlunosTexto, prepararImportacaoAlunos, importarAlunosEmLote,
@@ -6093,9 +6422,16 @@ function telaEquipesEscolherTurma(serieId){
       <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Série não encontrada</h2></div>`;
   }
   const turmas = DB.getTurmas().filter(t => t.serieId === serieId && t.ativo);
+  const grupos = DB.getAgrupamentosAtivosDaSerie(serieId);
   return `
     <button class="botao-voltar" onclick="location.hash='#/equipes'">&larr; Trocar série</button>
     <div class="secao-titulo">🏆 Equipes — ${serie.nome} — Escolha a turma</div>
+    ${grupos.map(g => `
+      <a href="#/equipes/${serieId}/${g.id}" class="cartao-escolha" style="border-color:var(--azul-quadra);">
+        <div><div class="titulo-escolha">🔗 ${g.nome}</div><div class="sub-escolha">Grupo de competição</div></div>
+        <span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
     ${!turmas.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma turma ativa nesta série.</p>' : turmas.map(t => `
       <a href="#/equipes/${serieId}/${t.id}" class="cartao-escolha">
         <div>
@@ -6110,20 +6446,20 @@ function telaEquipesEscolherTurma(serieId){
 
 function telaEquipesEscolherModalidade(serieId, turmaId){
   const serie = DB.getSeries().find(s => s.id === serieId);
-  const turma = DB.getTurmas().find(t => t.id === turmaId);
-  if(!serie || !turma){
+  const ctx = resolverContextoChaveamento(turmaId);
+  if(!serie || !ctx){
     return `<button class="botao-voltar" onclick="location.hash='#/equipes'">&larr; Equipes</button>
       <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Turma não encontrada</h2></div>`;
   }
   const modalidades = DB.modalidadesColetivasDaSerie(serieId);
   return `
     <button class="botao-voltar" onclick="location.hash='#/equipes/${serieId}'">&larr; Trocar turma</button>
-    <div class="secao-titulo">🏆 Equipes — ${serie.nome} ${turma.turma} — Escolha a modalidade</div>
+    <div class="secao-titulo">🏆 Equipes — ${ctx.rotulo} — Escolha a modalidade</div>
     ${!modalidades.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma modalidade coletiva vinculada a esta série.</p>' : modalidades.map(m => `
       <a href="#/equipes/${serieId}/${turmaId}/${m.id}" class="cartao-escolha">
         <div>
           <div class="titulo-escolha">${iconeModalidade(m.nome)} ${m.nome}</div>
-          <div class="sub-escolha">${DB.getAlunosInscritosModalidade(turmaId, m.id).length} inscritos</div>
+          <div class="sub-escolha">${DB.alunosElegiveisEquipePorContexto(turmaId, m.id).length} inscritos</div>
         </div>
         <span style="color:var(--texto-suave);">›</span>
       </a>
@@ -6131,16 +6467,217 @@ function telaEquipesEscolherModalidade(serieId, turmaId){
   `;
 }
 
-function telaEquipeDetalhe(serieId, turmaId, modalidadeId){
-  const serie = DB.getSeries().find(s => s.id === serieId);
-  const turma = DB.getTurmas().find(t => t.id === turmaId);
+let filtroCategoriaGrupoAtual = 'Masculino'; // estado da tela de Grupos (Masculino/Feminino/Misto)
+
+// Tela dedicada de Grupos (nova): reaproveita 100% a mesma equipe/
+// participação de sempre (DB.obterOuCriarEquipe, DB.getParticipacoesEquipe
+// etc.) -- só mostra o que é relevante para organizar grupos, sem os
+// campos da montagem tradicional (posição, capitão, limites, salvar
+// equipe). A tela tradicional (telaEquipeDetalhe) continua existindo
+// exatamente como antes, sem nada removido.
+function telaGruposEquipe(serieId, turmaId, modalidadeId){
+  const ctx = resolverContextoChaveamento(turmaId);
   const modalidade = DB.getModalidades().find(m => m.id === modalidadeId);
-  if(!serie || !turma || !modalidade){
+  if(!ctx || !modalidade){
+    return `<button class="botao-voltar" onclick="location.hash='#/equipes'">&larr; Equipes</button>
+      <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Não encontrado</h2></div>`;
+  }
+  const equipe = DB.obterOuCriarEquipePorContexto(turmaId, modalidadeId);
+  DB.alunosElegiveisEquipePorContexto(turmaId, modalidadeId).forEach(a => DB.obterOuCriarParticipacaoEquipe(equipe.id, a.id));
+
+  return `
+    <button class="botao-voltar no-print" onclick="location.hash='#/equipes/${serieId}/${turmaId}/${modalidadeId}'">&larr; Voltar à equipe</button>
+
+    <div class="bloco">
+      <h3 style="margin:0;">🔀 Grupos — ${iconeModalidade(modalidade.nome)} ${modalidade.nome}</h3>
+      <p style="font-size:13px; color:var(--texto-suave); margin:4px 0 0;">${ctx.rotulo}${ctx.tipo === 'grupo' ? ' · Grupo de competição' : ` · ${ctx.turma.turno}`}</p>
+    </div>
+
+    <div style="display:flex; gap:8px; margin-bottom:14px;">
+      <button type="button" class="botao" data-acao="filtro-categoria-grupo" data-categoria="Masculino" style="flex:1;">👨 Masculino</button>
+      <button type="button" class="botao" data-acao="filtro-categoria-grupo" data-categoria="Feminino" style="flex:1;">👩 Feminino</button>
+      <button type="button" class="botao" data-acao="filtro-categoria-grupo" data-categoria="Misto" style="flex:1;">👥 Misto</button>
+    </div>
+
+    <div class="bloco">
+      <div style="display:flex; gap:10px; margin-bottom:12px;">
+        <input type="text" id="novoGrupoNome" placeholder="Nome do novo grupo" style="flex:1; padding:10px; border-radius:var(--raio); border:1px solid var(--borda);">
+        <button class="botao botao-secundario" id="btnCriarGrupo" type="button">+ Criar</button>
+      </div>
+      <div class="linha-campos" style="max-width:none;">
+        <div class="campo" style="margin-bottom:0;">
+          <label for="qtdJogadoresPorGrupo">Jogadores por grupo</label>
+          <input type="number" id="qtdJogadoresPorGrupo" min="1" value="${DB.getJogadoresPorGrupoPadrao(modalidadeId)}">
+        </div>
+        <div class="campo" style="margin-bottom:0;">
+          <label for="qtdGruposAuto">Quantidade de grupos</label>
+          <input type="number" id="qtdGruposAuto" min="1" value="2">
+        </div>
+      </div>
+      <p style="font-size:11.5px; color:var(--texto-suave); margin:6px 0 10px;">A distribuição automática preenche cada grupo até essa quantidade de vagas. Se não houver alunos suficientes para preencher todas as vagas sem repetir ninguém, alunos já usados são repetidos em outro grupo (nunca duas vezes no mesmo grupo). Depois você pode ajustar cada grupo manualmente, sem obrigação de manter a quantidade exata.</p>
+      <button class="botao botao-secundario" id="btnDistribuirAuto" type="button" style="width:100%;">🔀 Distribuir automaticamente</button>
+    </div>
+
+    <div id="listaGruposEquipeCategoria"></div>
+  `;
+}
+
+function renderListaGruposEquipeCategoria(equipeId, categoria){
+  const container = document.getElementById('listaGruposEquipeCategoria');
+  if(!container) return;
+  const equipe = DB.getEquipes().find(e => e.id === equipeId);
+  const grupos = DB.getGruposEquipe(equipeId, categoria);
+  const elegiveis = DB.alunosElegiveisEquipePorCategoria(equipe.agrupamentoId || equipe.turmaId, equipe.modalidadeId, categoria)
+    .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+
+  if(!grupos.length){
+    container.innerHTML = `<p style="color:var(--texto-suave); font-size:13.5px; text-align:center; padding:14px 0;">Nenhum grupo ${categoria} criado ainda.</p>`;
+    return;
+  }
+  container.innerHTML = grupos.map(grupo => {
+    const alunosDoGrupo = DB.getAlunosDoGrupoEquipe(equipeId, grupo.id);
+    return `
+      <div class="bloco" data-grupo-id="${grupo.id}">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <h4 style="margin:0; font-family:'Oswald',sans-serif; font-size:15px;">${grupo.nome} <span style="font-weight:400; color:var(--texto-suave); font-size:12.5px;">— ${alunosDoGrupo.length} jogador${alunosDoGrupo.length === 1 ? '' : 'es'}</span></h4>
+          <div style="display:flex; gap:14px;">
+            <button type="button" class="botao-texto" data-acao="renomear-grupo" data-id="${grupo.id}">✏️ Renomear</button>
+            <button type="button" class="botao-texto" data-acao="excluir-grupo" data-id="${grupo.id}" style="color:#B23A3A;">🗑️ Excluir</button>
+          </div>
+        </div>
+        ${alunosDoGrupo.length ? `
+          <ol class="lista-numerada" style="margin:0 0 12px;">
+            ${alunosDoGrupo.map(a => `
+              <li style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+                <span>${a.nome}</span>
+                <button type="button" class="botao-texto" data-acao="remover-do-grupo" data-grupo="${grupo.id}" data-aluno="${a.id}" style="color:#B23A3A; font-size:12px;">remover</button>
+              </li>
+            `).join('')}
+          </ol>
+        ` : '<p style="font-size:12.5px; color:var(--texto-suave); margin:0 0 12px;">Nenhum aluno neste grupo ainda.</p>'}
+        <div style="display:flex; gap:8px;">
+          <select class="select-adicionar-grupo" data-grupo="${grupo.id}" style="flex:1; padding:9px; border-radius:var(--raio); border:1px solid var(--borda);">
+            <option value="">Adicionar aluno...</option>
+            ${elegiveis.map(a => `<option value="${a.id}">${a.nome}${alunosDoGrupo.some(x => x.id === a.id) ? ' (já está aqui)' : ''}</option>`).join('')}
+          </select>
+          <button type="button" class="botao botao-secundario" data-acao="adicionar-ao-grupo" data-grupo="${grupo.id}">+ Adicionar</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
+  const equipe = DB.obterOuCriarEquipePorContexto(turmaId, modalidadeId);
+  const equipeId = equipe.id;
+
+  function atualizarBotoesFiltro(){
+    document.querySelectorAll('button[data-acao="filtro-categoria-grupo"]').forEach(btn => {
+      const ativo = btn.dataset.categoria === filtroCategoriaGrupoAtual;
+      btn.classList.toggle('botao-primario', ativo);
+      btn.classList.toggle('botao-secundario', !ativo);
+    });
+  }
+  function atualizarTudo(){
+    atualizarBotoesFiltro();
+    renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+  }
+  atualizarTudo();
+
+  document.querySelectorAll('button[data-acao="filtro-categoria-grupo"]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      filtroCategoriaGrupoAtual = btn.dataset.categoria;
+      atualizarTudo();
+    });
+  });
+
+  document.getElementById('btnCriarGrupo').addEventListener('click', () => {
+    const input = document.getElementById('novoGrupoNome');
+    const nome = input.value.trim();
+    if(!nome){ alert('Informe um nome para o grupo.'); return; }
+    try {
+      DB.criarGrupoEquipe(equipeId, nome, filtroCategoriaGrupoAtual);
+      input.value = '';
+      mostrarToast('Grupo criado.');
+      renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+    } catch(err){
+      alert(err.message || 'Não foi possível criar o grupo.');
+    }
+  });
+
+  document.getElementById('qtdJogadoresPorGrupo').addEventListener('change', e => {
+    const jogadoresPorGrupo = Number(e.target.value);
+    if(!jogadoresPorGrupo || jogadoresPorGrupo < 1) return;
+    const elegiveis = DB.alunosElegiveisEquipePorCategoria(turmaId, modalidadeId, filtroCategoriaGrupoAtual);
+    document.getElementById('qtdGruposAuto').value = Math.max(1, Math.ceil(elegiveis.length / jogadoresPorGrupo));
+  });
+
+  document.getElementById('btnDistribuirAuto').addEventListener('click', () => {
+    const qtd = Number(document.getElementById('qtdGruposAuto').value);
+    const jogadoresPorGrupo = Number(document.getElementById('qtdJogadoresPorGrupo').value);
+    if(!qtd || qtd < 1){ alert('Informe pelo menos 1 grupo.'); return; }
+    if(!jogadoresPorGrupo || jogadoresPorGrupo < 1){ alert('Informe uma quantidade válida de jogadores por grupo.'); return; }
+    const jaTemGrupos = DB.getGruposEquipe(equipeId, filtroCategoriaGrupoAtual).length > 0;
+    if(jaTemGrupos && !confirm(`Já existem grupos ${filtroCategoriaGrupoAtual} criados. A distribuição automática vai substituí-los por novos grupos (Grupo 1, Grupo 2...). Os grupos das outras categorias não são afetados. Deseja continuar?`)) return;
+    try {
+      DB.distribuirAutomaticamenteGrupos(equipeId, qtd, filtroCategoriaGrupoAtual, jogadoresPorGrupo);
+      DB.definirJogadoresPorGrupoPadrao(modalidadeId, jogadoresPorGrupo);
+      mostrarToast('Alunos distribuídos automaticamente.');
+      renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+    } catch(err){
+      alert(err.message || 'Não foi possível distribuir automaticamente.');
+    }
+  });
+
+  document.getElementById('listaGruposEquipeCategoria').addEventListener('click', e => {
+    const btnRenomear = e.target.closest('button[data-acao="renomear-grupo"]');
+    if(btnRenomear){
+      const grupo = DB.getGruposEquipe(equipeId).find(g => g.id === btnRenomear.dataset.id);
+      const novoNome = prompt('Novo nome do grupo:', grupo ? grupo.nome : '');
+      if(!novoNome || !novoNome.trim()) return;
+      try {
+        DB.renomearGrupoEquipe(equipeId, btnRenomear.dataset.id, novoNome.trim());
+        renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      } catch(err){ alert(err.message || 'Não foi possível renomear.'); }
+      return;
+    }
+    const btnExcluir = e.target.closest('button[data-acao="excluir-grupo"]');
+    if(btnExcluir){
+      if(!confirm('Excluir este grupo? Os alunos não são removidos da equipe, só deixam de pertencer a este grupo.')) return;
+      DB.excluirGrupoEquipe(equipeId, btnExcluir.dataset.id);
+      mostrarToast('Grupo excluído.');
+      renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      return;
+    }
+    const btnRemoverDoGrupo = e.target.closest('button[data-acao="remover-do-grupo"]');
+    if(btnRemoverDoGrupo){
+      DB.removerAlunoDoGrupoEquipe(equipeId, btnRemoverDoGrupo.dataset.aluno, btnRemoverDoGrupo.dataset.grupo);
+      renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      return;
+    }
+    const btnAdicionarAoGrupo = e.target.closest('button[data-acao="adicionar-ao-grupo"]');
+    if(btnAdicionarAoGrupo){
+      const grupoId = btnAdicionarAoGrupo.dataset.grupo;
+      const select = document.querySelector(`.select-adicionar-grupo[data-grupo="${grupoId}"]`);
+      const alunoId = select ? select.value : '';
+      if(!alunoId) return;
+      try {
+        DB.adicionarAlunoAoGrupoEquipe(equipeId, alunoId, grupoId);
+        renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      } catch(err){ alert(err.message || 'Não foi possível adicionar.'); }
+    }
+  });
+}
+
+function telaEquipeDetalhe(serieId, turmaId, modalidadeId){
+  const ctx = resolverContextoChaveamento(turmaId);
+  const modalidade = DB.getModalidades().find(m => m.id === modalidadeId);
+  if(!ctx || !modalidade){
     return `<button class="botao-voltar" onclick="location.hash='#/equipes'">&larr; Equipes</button>
       <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Equipe não encontrada</h2></div>`;
   }
-  const equipe = DB.obterOuCriarEquipe(turmaId, modalidadeId);
-  DB.alunosElegiveisEquipe(turmaId, modalidadeId).forEach(a => {
+  const equipe = DB.obterOuCriarEquipePorContexto(turmaId, modalidadeId);
+  DB.alunosElegiveisEquipePorContexto(turmaId, modalidadeId).forEach(a => {
     DB.obterOuCriarParticipacaoEquipe(equipe.id, a.id);
   });
   const concluida = equipe.status === 'Finalizada';
@@ -6150,9 +6687,14 @@ function telaEquipeDetalhe(serieId, turmaId, modalidadeId){
   return `
     <button class="botao-voltar" onclick="location.hash='#/equipes/${serieId}/${turmaId}'">&larr; Trocar modalidade</button>
 
+    <a href="#/equipes/${serieId}/${turmaId}/${modalidadeId}/grupos" class="cartao-escolha" style="border-color:var(--azul-quadra); margin-bottom:14px;">
+      <div><div class="titulo-escolha">🔀 Organizar Grupos</div><div class="sub-escolha">Dividir os inscritos em grupos por categoria (Masculino/Feminino/Misto)</div></div>
+      <span style="color:var(--texto-suave);">›</span>
+    </a>
+
     <div class="bloco">
       <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
-        <h3>${iconeModalidade(modalidade.nome)} ${modalidade.nome}<br><span style="font-size:13px; font-weight:400; color:var(--texto-suave);">${serie.nome} ${turma.turma} · ${turma.turno}</span></h3>
+        <h3>${iconeModalidade(modalidade.nome)} ${modalidade.nome}<br><span style="font-size:13px; font-weight:400; color:var(--texto-suave);">${ctx.rotulo}${ctx.tipo === 'grupo' ? ' · Grupo de competição' : ` · ${ctx.turma.turno}`}</span></h3>
         <span class="selo-status-seletiva ${concluida ? 'selo-concluida' : 'selo-pendente'}" id="badgeStatusEquipe">${concluida ? '✅ Finalizada' : '⏳ Em montagem'}</span>
       </div>
 
@@ -6283,6 +6825,49 @@ function renderEquipeMontada(equipeId){
   elRes.innerHTML = reservas.length ? reservas.map(linha).join('') : '<li style="color:var(--texto-suave);">Nenhuma reserva ainda.</li>';
 }
 
+// Grupos dentro da equipe (novo): um aluno pode aparecer em vários
+// grupos ao mesmo tempo -- isso é intencional, não é bug/duplicação.
+function renderListaGruposEquipe(equipeId){
+  const container = document.getElementById('listaGruposEquipe');
+  if(!container) return;
+  const grupos = DB.resumoGruposEquipe(equipeId);
+  const elegiveis = DB.getParticipacoesEquipe(equipeId).map(p => DB.getAluno(p.alunoId)).filter(Boolean).sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+
+  if(!grupos.length){
+    container.innerHTML = '<p style="color:var(--texto-suave); font-size:13.5px; text-align:center; padding:10px 0;">Nenhum grupo criado ainda.</p>';
+    return;
+  }
+
+  container.innerHTML = grupos.map(({ grupo, alunos }) => `
+    <div class="bloco" data-grupo-id="${grupo.id}">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <h4 style="margin:0; font-family:'Oswald',sans-serif; font-size:15px;">${grupo.nome}</h4>
+        <div style="display:flex; gap:14px;">
+          <button type="button" class="botao-texto" data-acao="renomear-grupo" data-id="${grupo.id}">✏️ Renomear</button>
+          <button type="button" class="botao-texto" data-acao="excluir-grupo" data-id="${grupo.id}" style="color:#B23A3A;">🗑️ Excluir</button>
+        </div>
+      </div>
+      ${alunos.length ? `
+        <ol class="lista-numerada" style="margin:0 0 12px;">
+          ${alunos.map(a => `
+            <li style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+              <span>${a.nome}</span>
+              <button type="button" class="botao-texto" data-acao="remover-do-grupo" data-grupo="${grupo.id}" data-aluno="${a.id}" style="color:#B23A3A; font-size:12px;">remover</button>
+            </li>
+          `).join('')}
+        </ol>
+      ` : '<p style="font-size:12.5px; color:var(--texto-suave); margin:0 0 12px;">Nenhum aluno neste grupo ainda.</p>'}
+      <div style="display:flex; gap:8px;">
+        <select class="select-adicionar-grupo" data-grupo="${grupo.id}" style="flex:1; padding:9px; border-radius:var(--raio); border:1px solid var(--borda);">
+          <option value="">Adicionar aluno...</option>
+          ${elegiveis.map(a => `<option value="${a.id}">${a.nome}${alunos.some(x => x.id === a.id) ? ' (já está aqui)' : ''}</option>`).join('')}
+        </select>
+        <button type="button" class="botao botao-secundario" data-acao="adicionar-ao-grupo" data-grupo="${grupo.id}">+ Adicionar</button>
+      </div>
+    </div>
+  `).join('');
+}
+
 function renderListaAlunosEquipe(equipeId, modalidadeId){
   const container = document.getElementById('listaAlunosEquipe');
   if(!container) return;
@@ -6336,11 +6921,11 @@ function renderListaAlunosEquipe(equipeId, modalidadeId){
 }
 
 function ligarEventosEquipeDetalhe(serieId, turmaId, modalidadeId){
-  const equipe = DB.obterOuCriarEquipe(turmaId, modalidadeId);
+  const equipe = DB.obterOuCriarEquipePorContexto(turmaId, modalidadeId);
   const equipeId = equipe.id;
 
   function atualizarTudo(){
-    const atual = DB.getEquipe(turmaId, modalidadeId);
+    const atual = DB.getEquipePorContexto(turmaId, modalidadeId);
     renderContadoresEquipe(equipeId, atual);
     renderEquipeMontada(equipeId);
   }
@@ -6381,7 +6966,7 @@ function ligarEventosEquipeDetalhe(serieId, turmaId, modalidadeId){
   }
 
   document.getElementById('btnFinalizarEquipe').addEventListener('click', () => {
-    const atual = DB.getEquipe(turmaId, modalidadeId);
+    const atual = DB.getEquipePorContexto(turmaId, modalidadeId);
     const vaiFinalizar = atual.status !== 'Finalizada';
     const confirmado = confirm(vaiFinalizar ? 'Deseja finalizar esta equipe?' : 'Deseja reabrir esta equipe?');
     if(!confirmado) return;
@@ -6455,7 +7040,7 @@ function ligarEventosEquipeDetalhe(serieId, turmaId, modalidadeId){
       let novoStatus = alvo.value;
 
       if(novoStatus === 'Titular/Selecionado'){
-        const atual = DB.getEquipe(turmaId, modalidadeId);
+        const atual = DB.getEquipePorContexto(turmaId, modalidadeId);
         if(atual.limiteSelecionados > 0){
           const jaSelecionados = DB.contarSelecionadosEquipe(equipeId, participacaoId);
           if(jaSelecionados >= atual.limiteSelecionados){
@@ -6469,7 +7054,7 @@ function ligarEventosEquipeDetalhe(serieId, turmaId, modalidadeId){
           }
         }
       } else if(novoStatus === 'Reserva'){
-        const atual = DB.getEquipe(turmaId, modalidadeId);
+        const atual = DB.getEquipePorContexto(turmaId, modalidadeId);
         if(atual.limiteReservas > 0){
           const jaReservas = DB.contarReservasEquipe(equipeId, participacaoId);
           if(jaReservas >= atual.limiteReservas){
@@ -7814,14 +8399,13 @@ function telaChaveamentosHome(){
 
 function cardChaveamentoHtml(c){
   const modalidade = DB.getModalidades().find(m => m.id === c.modalidadeId);
-  const campeao = c.campeaoAlunoId ? DB.getAluno(c.campeaoAlunoId) : null;
   return `
     <a href="#/chaveamentos/${c.id}" class="cartao-escolha">
       <div>
-        <div class="titulo-escolha">${iconeModalidade(modalidade ? modalidade.nome : '')} ${modalidade ? modalidade.nome : ''} — ${nomeExibidoTurma(c.turmaId)}</div>
-        <div class="sub-escolha">${c.categoria}${campeao ? ' · 🥇 ' + campeao.nome : ''}${c.participanteUnico ? ' · 👤 Participante único' : ''}</div>
+        <div class="titulo-escolha">${iconeModalidade(modalidade ? modalidade.nome : '')} ${modalidade ? modalidade.nome : ''} — ${rotuloContextoChaveamento(c)}</div>
+        <div class="sub-escolha">${c.categoria}</div>
       </div>
-      <span class="selo-status-seletiva ${c.status === 'Finalizado' ? 'selo-concluida' : 'selo-pendente'}">${c.status === 'Finalizado' ? '✅' : '▶️'}</span>
+      <span class="selo-status-seletiva ${c.status === 'Finalizado' ? 'selo-concluida' : 'selo-pendente'}">${c.status === 'Finalizado' ? '✅ Finalizado' : '▶️ Em andamento'}</span>
     </a>
   `;
 }
@@ -7878,7 +8462,7 @@ function renderListaChaveamentos(){
   if(filtroModalidade) lista = lista.filter(c => c.modalidadeId === filtroModalidade);
   if(filtroCategoria) lista = lista.filter(c => c.categoria === filtroCategoria);
   if(filtroStatus) lista = lista.filter(c => c.status === filtroStatus);
-  if(busca) lista = lista.filter(c => nomeExibidoTurma(c.turmaId).toLowerCase().includes(busca));
+  if(busca) lista = lista.filter(c => rotuloContextoChaveamento(c).toLowerCase().includes(busca));
   lista = lista.slice().sort((a, b) => new Date(b.atualizadoEm) - new Date(a.atualizadoEm));
 
   container.innerHTML = lista.length
@@ -8726,27 +9310,42 @@ function renderAreaAtualizarSeletiva(chaveamentoId){
   if(!area) return;
   const c = DB.getChaveamento(chaveamentoId);
   const campeao = DB.getAluno(c.campeaoAlunoId);
-  const vice = c.viceAlunoId ? DB.getAluno(c.viceAlunoId) : null;
   if(!campeao) return;
+
+  // Correção: antes só sugeria campeão (Classificado) + vice (Reserva),
+  // ignorando a "🏅 Quantidade de classificados" definida para este
+  // chaveamento -- por isso o relatório de Alunos Classificados mostrava
+  // só 1 nome mesmo quando o professor tinha configurado mais. Agora
+  // reaproveita DB.classificadosChaveamento (mesma fonte já usada na
+  // tela e na impressão) para sugerir TODOS os classificados configurados.
+  const tipoAtual = c.tipo || 'principal';
+  const raizId = tipoAtual === 'principal' ? c.id : c.chaveamentoPrincipalId;
+  const resultado = raizId ? DB.classificadosChaveamento(raizId) : { quantidade:0, classificacao:[], classificados:[] };
+  const usarQuantidadeConfigurada = resultado.quantidade > 0;
+  const sugestoes = usarQuantidadeConfigurada
+    ? resultado.classificados
+    : [
+        { posicao:1, aluno: campeao },
+        ...(c.viceAlunoId ? [{ posicao:2, aluno: DB.getAluno(c.viceAlunoId) }] : [])
+      ];
+  const medalha = posicao => posicao === 1 ? '🥇' : posicao === 2 ? '🥈' : posicao === 3 ? '🥉' : `${posicao}º`;
 
   area.innerHTML = `
     <div class="bloco">
       <h3>Atualizar seletiva</h3>
-      <p style="font-size:13px; color:var(--texto-suave); margin:-4px 0 12px;">Confira a sugestão antes de aplicar.</p>
-      <div class="linha-colocacao">
-        <span class="nome-time-coloc">🥇 ${campeao.nome}</span>
-        <select id="statusSugeridoCampeao" class="select-status" style="width:auto;">
-          ${OPCOES_STATUS_SELETIVA.map(o => `<option value="${o.v}" ${o.v === 'Classificado' ? 'selected' : ''}>${o.label}</option>`).join('')}
-        </select>
-      </div>
-      ${vice ? `
+      <p style="font-size:13px; color:var(--texto-suave); margin:-4px 0 12px;">
+        ${usarQuantidadeConfigurada
+          ? `Confira antes de aplicar. Os ${sugestoes.length} classificados definidos em "🏅 Quantidade de classificados" serão marcados como Classificado.`
+          : 'Confira a sugestão antes de aplicar. Defina "🏅 Quantidade de classificados" acima para sugerir automaticamente mais do que campeão/vice.'}
+      </p>
+      ${sugestoes.map((item, i) => `
         <div class="linha-colocacao">
-          <span class="nome-time-coloc">🥈 ${vice.nome}</span>
-          <select id="statusSugeridoVice" class="select-status" style="width:auto;">
-            ${OPCOES_STATUS_SELETIVA.map(o => `<option value="${o.v}" ${o.v === 'Reserva' ? 'selected' : ''}>${o.label}</option>`).join('')}
+          <span class="nome-time-coloc">${medalha(item.posicao)} ${item.aluno.nome}</span>
+          <select id="statusSugerido-${item.aluno.id}" class="select-status" style="width:auto;">
+            ${OPCOES_STATUS_SELETIVA.map(o => `<option value="${o.v}" ${o.v === (usarQuantidadeConfigurada || i === 0 ? 'Classificado' : 'Reserva') ? 'selected' : ''}>${o.label}</option>`).join('')}
           </select>
         </div>
-      ` : ''}
+      `).join('')}
       <button class="botao botao-primario" id="btnConfirmarAtualizarSeletiva" type="button" style="width:100%; margin-top:10px;">Confirmar atualização da seletiva</button>
     </div>
   `;
@@ -8755,9 +9354,9 @@ function renderAreaAtualizarSeletiva(chaveamentoId){
     const btn = document.getElementById('btnConfirmarAtualizarSeletiva');
     const ok = await executarComFeedback(btn, 'Salvando...', async () => {
       const seletiva = await DB.obterOuCriarSeletiva(c.modalidadeId, c.serieId, c.categoria);
-      await aplicarStatusSeletivaComLimite(seletiva, campeao.id, document.getElementById('statusSugeridoCampeao').value);
-      if(vice){
-        await aplicarStatusSeletivaComLimite(seletiva, vice.id, document.getElementById('statusSugeridoVice').value);
+      for(const item of sugestoes){
+        const statusEscolhido = document.getElementById(`statusSugerido-${item.aluno.id}`).value;
+        await aplicarStatusSeletivaComLimite(seletiva, item.aluno.id, statusEscolhido);
       }
     });
     if(!ok) return;
@@ -8797,9 +9396,10 @@ function ligarEventosChaveamentoDetalhe(chaveamentoId){
       const avisoFaseSeguinte = DB.temFaseSeguinteGerada(chaveamentoId)
         ? '\n\n⚠️ Repescagem e/ou final já foram geradas a partir deste chaveamento. Elas NÃO são atualizadas automaticamente -- se a correção mudar quem ganhou/perdeu, use "🎲 Refazer sorteio" na repescagem/final depois de corrigir aqui.'
         : '';
-      const mensagem = (dependente
-        ? '⚠️ Alterar este resultado afetará confrontos posteriores.\n\nOs resultados que dependem dele serão desfeitos (quem avançou por engano deixará de aparecer na fase seguinte). Deseja continuar?'
-        : 'Deseja corrigir o vencedor deste confronto?') + avisoFaseSeguinte;
+      const avisoCascata = dependente
+        ? '\n\nOs confrontos que dependem deste resultado serão desfeitos (quem avançou por engano deixará de aparecer na fase seguinte).'
+        : '';
+      const mensagem = `⚠️ Esta alteração pode modificar confrontos posteriores e a classificação do chaveamento (campeão, vice, 3º lugar e classificados).${avisoCascata}\n\nDeseja continuar?${avisoFaseSeguinte}`;
       if(!confirm(mensagem)) return;
       confrontosEmEdicao.add(confrontoId);
       rerenderizarChaveamentoDetalhe(chaveamentoId);
@@ -9838,6 +10438,14 @@ function conteudoFichaTurma(turmaId){
             <div class="linha-relatorio"><span>Titulares:</span><span>${e.titulares.length ? e.titulares.map(a=>a.nome).join(', ') : '— Não definido'}</span></div>
             <div class="linha-relatorio"><span>Reservas:</span><span>${e.reservas.length ? e.reservas.map(a=>a.nome).join(', ') : '— Não definido'}</span></div>
             <div class="linha-relatorio"><span>Capitão:</span><span>${e.capitao ? e.capitao.nome : '— Não definido'}</span></div>
+            ${e.grupos.length ? e.grupos.map(secao => `
+              <div style="margin-top:8px;">
+                <div style="font-weight:700; font-size:12px; text-transform:uppercase; color:var(--texto-suave);">${secao.categoria === 'Masculino' ? '👨' : secao.categoria === 'Feminino' ? '👩' : '👥'} ${secao.categoria}</div>
+                ${secao.grupos.map(g => `
+                  <div class="linha-relatorio" style="align-items:flex-start;"><span>${g.grupo.nome} — ${g.alunos.length} jogador${g.alunos.length === 1 ? '' : 'es'}:</span><span>${g.alunos.map(a=>a.nome).join(', ')}</span></div>
+                `).join('')}
+              </div>
+            `).join('') : ''}
           `}
         </div>
       `).join('')}
@@ -10307,6 +10915,13 @@ function conteudoClassificadosSimplificado(resumo){
       : '<p class="vazio-classificados">—</p>';
   }
 
+  // Bloco 12: seção de coletivas do mesmo contexto -- fonte de dados
+  // totalmente separada dos classificados de seletiva (acima). Cada
+  // turma aparece identificada (equipes são sempre por turma, mesmo
+  // quando o contexto de impressão é um agrupamento de turmas).
+  const idContextoColetivas = resumo.agrupamento ? resumo.agrupamento.id : (resumo.turmas[0] ? resumo.turmas[0].id : null);
+  const coletivas = idContextoColetivas ? DB.relatorioColetivasContexto(idContextoColetivas) : [];
+
   return `
     <div class="capa-classificados">
       <div class="marca-evento-classificados">${cfg.nomeEvento} ${cfg.ano}</div>
@@ -10314,7 +10929,9 @@ function conteudoClassificadosSimplificado(resumo){
       <div class="serie-classificados">${resumo.serie ? resumo.serie.nome.toUpperCase() : ''} — ${rotuloTurmas}</div>
       ${resumo.tipo === 'grupo' ? '<div class="selo-grupo-classificados">Grupo de competição</div>' : ''}
     </div>
-    ${!resumo.blocos.length ? '<p style="text-align:center; color:var(--texto-suave); padding:30px 0;">Nenhum aluno classificado ainda para este contexto.</p>' : resumo.blocos.map(b => `
+
+    <div class="cabecalho-modalidade-classificados" style="border-bottom-color:var(--azul-quadra); color:var(--azul-quadra);">🏆 CLASSIFICADOS — MODALIDADES INDIVIDUAIS</div>
+    ${!resumo.blocos.length ? '<p style="text-align:center; color:var(--texto-suave); padding:16px 0;">Nenhum aluno classificado ainda para este contexto.</p>' : resumo.blocos.map(b => `
       <div class="bloco-modalidade-classificados">
         <div class="cabecalho-modalidade-classificados">${iconeModalidade(b.modalidade.nome)} ${b.modalidade.nome.toUpperCase()}</div>
         <div class="grade-classificados-sexo">
@@ -10329,6 +10946,24 @@ function conteudoClassificadosSimplificado(resumo){
         </div>
       </div>
     `).join('')}
+
+    ${coletivas.length ? `
+      <div class="cabecalho-modalidade-classificados" style="border-bottom-color:var(--fase-repescagem); color:var(--fase-repescagem); margin-top:18px;">⚽ MODALIDADES COLETIVAS</div>
+      ${coletivas.map(item => `
+        <div class="bloco-modalidade-classificados">
+          <div class="cabecalho-modalidade-classificados">${iconeModalidade(item.modalidade.nome)} ${item.modalidade.nome.toUpperCase()} — ${item.agrupamento ? item.agrupamento.nome : item.turma.turma}</div>
+          ${item.categorias.map(secaoCategoria => `
+            <div style="margin-top:8px;">
+              <div class="rotulo-coluna-classificados">${secaoCategoria.categoria === 'Masculino' ? '👨' : secaoCategoria.categoria === 'Feminino' ? '👩' : '👥'} ${secaoCategoria.categoria.toUpperCase()}</div>
+              ${secaoCategoria.grupos.map(g => `
+                <p style="font-size:12.5px; font-weight:700; margin:8px 0 2px;">${g.grupo.nome} — ${g.alunos.length} jogador${g.alunos.length === 1 ? '' : 'es'}</p>
+                <ol class="lista-classificados">${g.alunos.map(a => `<li>${a.nome}${item.agrupamento ? ` — ${nomeExibidoTurma(a.turmaId)}` : ''}</li>`).join('')}</ol>
+              `).join('')}
+            </div>
+          `).join('')}
+        </div>
+      `).join('')}
+    ` : ''}
   `;
 }
 function telaRelatorioClassificados(idTurmaOuGrupo){
@@ -11269,6 +11904,10 @@ async function renderizar(){
     app.innerHTML = telaSeletivasEscolherTurma(serieId);
   } else if(rota === '#/equipes'){
     app.innerHTML = telaEquipesEscolherSerie();
+  } else if(rota.match(/^#\/equipes\/[^/]+\/[^/]+\/[^/]+\/grupos$/)){
+    const [, serieId, turmaId, modalidadeId] = rota.match(/^#\/equipes\/([^/]+)\/([^/]+)\/([^/]+)\/grupos$/);
+    app.innerHTML = telaGruposEquipe(serieId, turmaId, modalidadeId);
+    ligarEventosGruposEquipe(serieId, turmaId, modalidadeId);
   } else if(rota.match(/^#\/equipes\/[^/]+\/[^/]+\/[^/]+$/)){
     const [, serieId, turmaId, modalidadeId] = rota.match(/^#\/equipes\/([^/]+)\/([^/]+)\/([^/]+)$/);
     app.innerHTML = telaEquipeDetalhe(serieId, turmaId, modalidadeId);
