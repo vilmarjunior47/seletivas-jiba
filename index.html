@@ -3579,10 +3579,95 @@ const DB = (() => {
     if(!definitivo) return { quantidade: 0, definitivoId: null, classificacao: [], classificados: [] };
     const quantidade = definitivo.quantidadeClassificados || 0;
     const classificacao = classificacaoFinalChaveamento(raizId);
+    const originais = quantidade > 0 ? classificacao.slice(0, quantidade) : [];
+    let classificados = originais;
+    let alterado = false;
+
+    // Alterar classificados (novo): se o administrador substituiu alguém
+    // depois da seletiva, a lista atual fica em `classificadosAlterados`
+    // (ids, no chaveamento definitivo). O resultado/classificação original
+    // (campeão, vice, terceiro, confrontos) NÃO é tocado -- só esta lista.
+    // Só vale se ainda bater com a quantidade configurada e com um
+    // chaveamento finalizado; senão cai de volta na lista original.
+    const idsAlterados = definitivo.classificadosAlterados;
+    if(quantidade > 0 && originais.length === quantidade && Array.isArray(idsAlterados)
+        && idsAlterados.length === quantidade && new Set(idsAlterados).size === quantidade
+        && idsAlterados.every(id => getAluno(id))){
+      const conjunto = new Set(idsAlterados);
+      const mantidos = originais.filter(i => conjunto.has(i.aluno.id));
+      const posicoesLivres = originais.filter(i => !conjunto.has(i.aluno.id)).map(i => i.posicao);
+      const adicionados = idsAlterados
+        .filter(id => !originais.some(i => i.aluno.id === id))
+        .map((id, k) => ({ posicao: posicoesLivres[k], aluno: getAluno(id) }));
+      classificados = [...mantidos, ...adicionados].sort((a, b) => a.posicao - b.posicao);
+      alterado = true;
+    }
     return {
-      quantidade, definitivoId: definitivo.id, classificacao,
-      classificados: quantidade > 0 ? classificacao.slice(0, quantidade) : []
+      quantidade, definitivoId: definitivo.id, classificacao, originais, alterado,
+      classificados
     };
+  }
+
+  // Alunos que podem ser escolhidos ao alterar classificados: os inscritos
+  // naquela seletiva (mesma regra de quem pode entrar no chaveamento --
+  // turma individual ou todas as turmas do agrupamento), mais os
+  // classificados atuais (para poder mantê-los). Só leitura.
+  function alunosElegiveisParaAlterarClassificados(raizId){
+    const { principal } = obterFamiliaChaveamento(raizId);
+    if(!principal) return [];
+    const contexto = principal.agrupamentoId || principal.turmaId;
+    const elegiveis = alunosElegiveisChaveamentoContexto(contexto, principal.modalidadeId, principal.categoria);
+    const atuais = classificadosChaveamento(raizId).classificados.map(i => i.aluno);
+    const vistos = new Set();
+    const resultado = [];
+    atuais.concat(elegiveis.slice().sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'))).forEach(a => {
+      if(!vistos.has(a.id)){ vistos.add(a.id); resultado.push(a); }
+    });
+    return resultado;
+  }
+
+  // Grava a nova lista de classificados (exatamente `quantidade` alunos,
+  // sem repetir, todos inscritos na seletiva). NÃO mexe em confrontos,
+  // campeão/vice/terceiro, quantidadeClassificados, turma ou inscrições.
+  // Se a lista de classificados já tinha sido levada para a seletiva
+  // ("Atualizar seletiva"), acompanha a troca lá também -- é de lá que o
+  // relatório "Alunos Classificados" da professora lê. Quem saiu de
+  // "Classificado" vira 'Desistiu' (se era da classificação original) ou
+  // 'Aguardando' (se era um substituto); quem entrou vira 'Classificado'.
+  // Voltar exatamente à lista original apaga a alteração.
+  async function salvarClassificadosAlterados(raizId, alunoIds){
+    const info = classificadosChaveamento(raizId);
+    if(!info.definitivoId || info.quantidade < 1) throw new Error('Defina a quantidade de classificados antes de alterar a lista.');
+    if(info.originais.length !== info.quantidade) throw new Error('O chaveamento ainda não está finalizado.');
+    if(!Array.isArray(alunoIds) || alunoIds.length !== info.quantidade) throw new Error(`Selecione exatamente ${info.quantidade} classificado(s).`);
+    if(new Set(alunoIds).size !== alunoIds.length) throw new Error('Não é permitido repetir o mesmo aluno.');
+    const permitidos = new Set(alunosElegiveisParaAlterarClassificados(raizId).map(a => a.id));
+    if(alunoIds.some(id => !permitidos.has(id))) throw new Error('Só é possível escolher alunos inscritos nesta seletiva.');
+
+    const { principal } = obterFamiliaChaveamento(raizId);
+    const idsAntes = info.classificados.map(i => i.aluno.id);
+    const idsOriginais = info.originais.map(i => i.aluno.id);
+    const removidos = idsAntes.filter(id => !alunoIds.includes(id));
+    const adicionados = alunoIds.filter(id => !idsAntes.includes(id));
+
+    const seletiva = getSeletiva(principal.modalidadeId, principal.serieId, principal.categoria);
+    if(seletiva && (removidos.length || adicionados.length)){
+      const participacoes = getParticipacoes(seletiva.id);
+      const jaLevadoParaSeletiva = idsAntes.some(id => participacoes.some(p => p.alunoId === id && p.status === 'Classificado'));
+      if(jaLevadoParaSeletiva){
+        for(const id of removidos){
+          const p = participacoes.find(x => x.alunoId === id);
+          if(p && p.status === 'Classificado') await atualizarParticipacao(p.id, { status: idsOriginais.includes(id) ? 'Desistiu' : 'Aguardando' });
+        }
+        for(const id of adicionados){
+          const p = await obterOuCriarParticipacao(seletiva.id, id);
+          await atualizarParticipacao(p.id, { status: 'Classificado', presente: true });
+        }
+      }
+    }
+    const igualOriginal = alunoIds.every(id => idsOriginais.includes(id));
+    atualizarChaveamento(info.definitivoId, { classificadosAlterados: igualOriginal ? null : alunoIds.slice() });
+    return classificadosChaveamento(raizId);
   }
 
   function gerarRepescagem(chaveamentoPrincipalId){
@@ -4351,6 +4436,7 @@ const DB = (() => {
     embaralharFisherYates, alunosElegiveisChaveamento, alunosElegiveisChaveamentoContexto,
     getChaveamentosPorContextoGeral, obterNomesFases,
     classificacaoFinalChaveamento, definirQuantidadeClassificados, classificadosChaveamento,
+    alunosElegiveisParaAlterarClassificados, salvarClassificadosAlterados,
     marcarFaltaChaveamento, adiarConfronto, retomarConfrontoAdiado,
     previaReorganizacaoChaveamento, reorganizarChaveamento, trocarPosicoesChaveamento,
     alunosDisponiveisParaAdicionar, confrontosComPosicaoDisponivel, adicionarAlunoAoChaveamento,
@@ -9035,7 +9121,11 @@ function htmlClassificadosChaveamento(raizId){
         ${Array.from({ length: totalParticipantes }, (_, i) => i + 1).map(n => `<option value="${n}" ${r.quantidade === n ? 'selected' : ''}>${n}</option>`).join('')}
       </select>
       <button class="botao botao-primario" id="btnSalvarQuantidadeClassificados" type="button" style="width:100%; margin-top:10px;">Salvar</button>
+      ${r.quantidade > 0 && r.originais.length === r.quantidade ? `
+        <button class="botao botao-secundario" id="btnAlterarClassificados" type="button" style="width:100%; margin-top:10px;">🔄 Alterar classificados</button>
+      ` : ''}
     </div>
+    <div id="areaAlterarClassificados" class="no-print"></div>
     ${r.classificados.length ? `
       <div class="bloco">
         <h3 style="margin-bottom:8px;">🏅 Classificados (${r.classificados.length})</h3>
@@ -9045,6 +9135,65 @@ function htmlClassificadosChaveamento(raizId){
       </div>
     ` : ''}
   `;
+}
+
+// Alterar classificados (novo): painel simples para trocar quem vai ao
+// JIBA depois da seletiva. Não mexe no resultado do chaveamento -- só na
+// lista de classificados (DB.salvarClassificadosAlterados).
+function renderAreaAlterarClassificados(chaveamentoId, raizId){
+  const area = document.getElementById('areaAlterarClassificados');
+  if(!area) return;
+  const info = DB.classificadosChaveamento(raizId);
+  const principal = DB.getChaveamento(raizId);
+  const modalidade = DB.getModalidades().find(m => m.id === principal.modalidadeId);
+  const elegiveis = DB.alunosElegiveisParaAlterarClassificados(raizId);
+  const atuaisIds = new Set(info.classificados.map(i => i.aluno.id));
+  const doGrupo = !!principal.agrupamentoId;
+
+  area.innerHTML = `
+    <div class="bloco">
+      <h3 style="margin-bottom:4px;">ALTERAR CLASSIFICADOS</h3>
+      <p style="font-size:13px; color:var(--texto-suave); margin:0 0 10px;">${modalidade ? modalidade.nome : ''} — ${rotuloContextoChaveamento(principal)}<br>Quantidade de classificados: <strong>${info.quantidade}</strong></p>
+      <p style="font-size:12px; color:var(--texto-suave); margin:0 0 10px;">Desmarque quem não vai ao JIBA e marque o substituto. Isso não altera o resultado do chaveamento.</p>
+      ${elegiveis.map(a => `
+        <label class="item-checkbox-modalidade ${atuaisIds.has(a.id) ? 'marcado' : ''}" style="margin-bottom:8px;">
+          <input type="checkbox" class="check-alterar-classificado" value="${a.id}" ${atuaisIds.has(a.id) ? 'checked' : ''}> ${a.nome}${doGrupo ? ` — ${nomeExibidoTurma(a.turmaId)}` : ''}
+        </label>
+      `).join('')}
+      <p id="contagemAlterarClassificados" style="font-size:13px; font-weight:700; margin:10px 0;"></p>
+      <button class="botao botao-primario" id="btnSalvarAlterarClassificados" type="button" style="width:100%;">Salvar classificados</button>
+      <button class="botao-texto" id="btnCancelarAlterarClassificados" type="button" style="width:100%; margin-top:8px;">Cancelar</button>
+    </div>
+  `;
+
+  function atualizarContagem(){
+    const marcados = area.querySelectorAll('.check-alterar-classificado:checked').length;
+    const ok = marcados === info.quantidade;
+    const el = document.getElementById('contagemAlterarClassificados');
+    el.textContent = `Selecionados: ${marcados} de ${info.quantidade}`;
+    el.style.color = ok ? 'var(--cor-vitoria)' : 'var(--cor-derrota)';
+    document.getElementById('btnSalvarAlterarClassificados').disabled = !ok;
+  }
+  area.querySelectorAll('.check-alterar-classificado').forEach(chk => chk.addEventListener('change', atualizarContagem));
+  atualizarContagem();
+
+  document.getElementById('btnCancelarAlterarClassificados').addEventListener('click', () => { area.innerHTML = ''; });
+  document.getElementById('btnSalvarAlterarClassificados').addEventListener('click', async () => {
+    const ids = Array.from(area.querySelectorAll('.check-alterar-classificado:checked')).map(chk => chk.value);
+    const btn = document.getElementById('btnSalvarAlterarClassificados');
+    const textoOriginal = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Salvando...';
+    try {
+      await DB.salvarClassificadosAlterados(raizId, ids);
+    } catch(e){
+      console.error('Erro ao alterar classificados:', e);
+      alert(e && e.message ? e.message : 'Não foi possível salvar. Verifique sua conexão e tente novamente.');
+      btn.disabled = false; btn.textContent = textoOriginal;
+      return;
+    }
+    mostrarToast('Classificados atualizados.');
+    rerenderizarChaveamentoDetalhe(chaveamentoId);
+  });
 }
 
 function telaChaveamentoDetalhe(chaveamentoId){
@@ -9523,6 +9672,15 @@ function ligarEventosChaveamentoDetalhe(chaveamentoId){
       DB.definirQuantidadeClassificados(definitivoId, quantidade);
       mostrarToast(quantidade > 0 ? `${quantidade} classificado(s) definido(s).` : 'Quantidade removida.');
       rerenderizarChaveamentoDetalhe(chaveamentoId);
+    });
+  }
+
+  const btnAlterarClassificados = document.getElementById('btnAlterarClassificados');
+  if(btnAlterarClassificados){
+    btnAlterarClassificados.addEventListener('click', () => {
+      const cAtual = DB.getChaveamento(chaveamentoId);
+      const raizIdLocal = (cAtual.tipo || 'principal') === 'principal' ? cAtual.id : cAtual.chaveamentoPrincipalId;
+      renderAreaAlterarClassificados(chaveamentoId, raizIdLocal);
     });
   }
 
