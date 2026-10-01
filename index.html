@@ -887,10 +887,25 @@
     margin-bottom:8px; border-bottom:1px solid var(--borda); padding-bottom:4px;
   }
   .lista-classificados{ font-size:14px; line-height:1.85; padding-left:20px; margin:0; word-break:break-word; }
+  .lista-classificados-conferencia{ font-size:14px; line-height:2; padding-left:0; margin:0; word-break:break-word; list-style:none; }
+  .lista-classificados-conferencia li{ display:flex; align-items:baseline; gap:8px; }
+  .lista-classificados-conferencia li::before{ content:'☐'; font-size:15px; flex-shrink:0; }
   .vazio-classificados{ color:var(--texto-suave); font-size:13px; margin:0; }
   @media (max-width:480px){
     .grade-classificados-sexo{ grid-template-columns:1fr; }
   }
+  /* Grupos de modalidades coletivas lado a lado (impressão) -- a
+     quantidade de colunas é escolhida em JS (grade-grupos-cols-N) na
+     hora de montar o HTML, conforme a quantidade de grupos daquela
+     categoria. Cada grupo some sozinho quando não cabe mais nada nele
+     (cresce verticalmente normal); não corta nome (mesmo
+     word-break:break-word da lista de sempre). */
+  .grade-grupos-coletiva{ display:grid; gap:4px 20px; margin-top:6px; }
+  .grade-grupos-coletiva .coluna-grupo-coletiva{ min-width:0; }
+  .grade-grupos-coletiva .coluna-grupo-coletiva p{ margin:8px 0 2px; }
+  .grade-grupos-cols-1{ grid-template-columns:1fr; }
+  .grade-grupos-cols-2{ grid-template-columns:1fr 1fr; }
+  .grade-grupos-cols-3{ grid-template-columns:1fr 1fr 1fr; }
 
   /* ---------- Etapa 2B-4: Inscrições por turma (lado a lado M/F) ---------- */
   .etiqueta-tipo-modalidade{
@@ -918,6 +933,8 @@
        ficha completa da turma, mesmo com um filtro ativo */
     .oculto-busca, .oculto-busca-secao{ display:block !important; }
     .grade-inscricoes-sexo{ grid-template-columns: 1fr 1fr !important; }
+    .grade-grupos-cols-2{ grid-template-columns: 1fr 1fr !important; }
+    .grade-grupos-cols-3{ grid-template-columns: 1fr 1fr 1fr !important; }
   }
 
   /* ---------- IMPORTAÇÃO RÁPIDA DE ALUNOS (Bloco 10) ---------- */
@@ -1420,7 +1437,8 @@ const DB = (() => {
     finaisJiba: 'jiba_finais_jiba',
     participantesFinalJiba: 'jiba_participantes_final_jiba',
     confrontosFinalJiba: 'jiba_confrontos_final_jiba',
-    jogadoresPorGrupoModalidade: 'jiba_jogadores_por_grupo_modalidade'
+    jogadoresPorGrupoModalidade: 'jiba_jogadores_por_grupo_modalidade',
+    quantidadeClassificadosDireta: 'jiba_quantidade_classificados_direta'
   };
 
   function lerLista(chave){
@@ -1825,6 +1843,91 @@ const DB = (() => {
     const faltantes = elegiveis.filter(a => !_cacheParticipacoesSeletiva.some(p => p.seletivaId === seletiva.id && p.alunoId === a.id));
     for(const aluno of faltantes){
       await obterOuCriarParticipacao(seletiva.id, aluno.id);
+    }
+    return seletiva;
+  }
+
+  /* ============================================================
+     CLASSIFICAÇÃO DIRETA (novo)
+     ------------------------------------------------------------
+     Investigado antes de criar: os classificados que a professora vê
+     (DB.relatorioClassificadosSimplificado) não vêm do chaveamento --
+     vêm do `status` ('Classificado') de `participacoes_seletiva`. O
+     chaveamento só é UM dos caminhos que leva até lá (via "Atualizar
+     seletiva"). Então classificação direta reaproveita exatamente a
+     mesma coluna: marca o status da participação como 'Classificado'
+     sem criar chaveamento, confronto ou resultado nenhum. A origem
+     (chaveamento vs. direta) fica só no campo `observacao` da própria
+     participação (coluna livre, já existente no schema) -- não é lido
+     por nenhum relatório, então a professora nunca vê isso.
+
+     A "quantidade de classificados" para este caminho não existe em
+     lugar nenhum hoje (ela só existe presa a um chaveamento). Guardei
+     num registro novo, só em localStorage (como "jogadores por grupo"
+     padrão, do módulo de Equipes) -- nenhuma tabela nova no Supabase.
+  ============================================================ */
+  function getQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, contextoId){
+    const r = lerLista(CHAVES.quantidadeClassificadosDireta).find(x =>
+      x.modalidadeId === modalidadeId && x.serieId === serieId && x.categoria === categoria && x.contextoId === contextoId);
+    return r ? r.quantidade : 0;
+  }
+  function definirQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, contextoId, quantidade){
+    if(!quantidade || quantidade < 1) throw new Error('Informe uma quantidade válida.');
+    const lista = lerLista(CHAVES.quantidadeClassificadosDireta).filter(x =>
+      !(x.modalidadeId === modalidadeId && x.serieId === serieId && x.categoria === categoria && x.contextoId === contextoId));
+    lista.push({ modalidadeId, serieId, categoria, contextoId, quantidade });
+    salvarLista(CHAVES.quantidadeClassificadosDireta, lista);
+  }
+
+  // Elegíveis da seletiva restritos a uma turma OU a todas as turmas de
+  // um agrupamento -- reaproveita alunosElegiveisSeletiva (série inteira,
+  // já existente) e contextoApresentacaoResultado (turma/agrupamento, já
+  // existente nos Relatórios), sem criar lógica nova de elegibilidade.
+  function alunosElegiveisSeletivaContexto(idTurmaOuAgrupamento, modalidadeId, serieId, categoria){
+    const ctx = contextoApresentacaoResultado(idTurmaOuAgrupamento);
+    if(!ctx) return [];
+    const idsTurmas = new Set(ctx.turmas.map(t => t.id));
+    return alunosElegiveisSeletiva(modalidadeId, serieId, categoria).filter(a => idsTurmas.has(a.turmaId));
+  }
+
+  // Classificados atuais por classificação direta nesta seletiva+contexto
+  // (status 'Classificado' + observação marcando a origem) -- usado pela
+  // tela, para já vir com a seleção certa ao reabrir.
+  function classificadosDiretosAtuais(idTurmaOuAgrupamento, modalidadeId, serieId, categoria){
+    const seletiva = getSeletiva(modalidadeId, serieId, categoria);
+    if(!seletiva) return [];
+    const idsTurmas = new Set((contextoApresentacaoResultado(idTurmaOuAgrupamento) || { turmas: [] }).turmas.map(t => t.id));
+    return getParticipacoes(seletiva.id)
+      .filter(p => p.status === 'Classificado' && p.observacao === 'classificacao_direta')
+      .map(p => getAluno(p.alunoId))
+      .filter(a => a && idsTurmas.has(a.turmaId));
+  }
+
+  // Grava a classificação direta: marca exatamente os alunos escolhidos
+  // como 'Classificado' na seletiva (mesma coluna que o chaveamento usa)
+  // e qualquer outro aluno do MESMO contexto+categoria que estivesse
+  // marcado como direto e não foi reselecionado volta para 'Aguardando'
+  // (permite desmarcar/trocar). Nunca mexe em participação cuja origem
+  // não é 'classificacao_direta' (não interfere no caminho do
+  // chaveamento). Não cria inscrição, não cria chaveamento, não mexe em
+  // confronto/resultado algum.
+  async function salvarClassificacaoDireta(idTurmaOuAgrupamento, modalidadeId, serieId, categoria, alunoIds){
+    if(!Array.isArray(alunoIds) || !alunoIds.length) throw new Error('Selecione os alunos classificados.');
+    if(new Set(alunoIds).size !== alunoIds.length) throw new Error('Não é permitido repetir o mesmo aluno.');
+    const quantidade = getQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, idTurmaOuAgrupamento);
+    if(quantidade > 0 && alunoIds.length !== quantidade) throw new Error(`Selecione exatamente ${quantidade} classificado(s).`);
+    const elegiveis = new Set(alunosElegiveisSeletivaContexto(idTurmaOuAgrupamento, modalidadeId, serieId, categoria).map(a => a.id));
+    if(alunoIds.some(id => !elegiveis.has(id))) throw new Error('Só é possível classificar alunos inscritos nesta seletiva.');
+
+    const seletiva = await obterOuCriarSeletiva(modalidadeId, serieId, categoria);
+    const diretosAntes = classificadosDiretosAtuais(idTurmaOuAgrupamento, modalidadeId, serieId, categoria).map(a => a.id);
+    for(const id of diretosAntes.filter(id => !alunoIds.includes(id))){
+      const p = getParticipacoes(seletiva.id).find(x => x.alunoId === id);
+      if(p) await atualizarParticipacao(p.id, { status: 'Aguardando', observacao: '' });
+    }
+    for(const id of alunoIds){
+      const p = await obterOuCriarParticipacao(seletiva.id, id);
+      await atualizarParticipacao(p.id, { status: 'Classificado', presente: true, observacao: 'classificacao_direta' });
     }
     return seletiva;
   }
@@ -2409,6 +2512,24 @@ const DB = (() => {
       .filter(p => (p.grupoIds || []).includes(grupoId))
       .map(p => getAluno(p.alunoId))
       .filter(Boolean);
+  }
+
+  // Troca manual (novo): troca a posição de 2 alunos entre 2 grupos
+  // diferentes -- reaproveita adicionar/removerAlunoDoGrupoEquipe já
+  // existentes, não mexe na distribuição automática nem em nenhuma
+  // outra lógica de grupos. Mantém a quantidade de cada grupo igual
+  // (1 sai, 1 entra, nos dois lados), exceto no caso raro em que um dos
+  // alunos já pertencia legitimamente aos dois grupos ao mesmo tempo.
+  function trocarAlunosEntreGrupos(equipeId, alunoId1, grupoId1, alunoId2, grupoId2){
+    if(grupoId1 === grupoId2) throw new Error('Escolha alunos de grupos diferentes para trocar.');
+    const membrosG1 = getAlunosDoGrupoEquipe(equipeId, grupoId1).map(a => a.id);
+    const membrosG2 = getAlunosDoGrupoEquipe(equipeId, grupoId2).map(a => a.id);
+    if(!membrosG1.includes(alunoId1)) throw new Error('O primeiro aluno selecionado não está no grupo informado.');
+    if(!membrosG2.includes(alunoId2)) throw new Error('O segundo aluno selecionado não está no grupo informado.');
+    removerAlunoDoGrupoEquipe(equipeId, alunoId1, grupoId1);
+    removerAlunoDoGrupoEquipe(equipeId, alunoId2, grupoId2);
+    adicionarAlunoAoGrupoEquipe(equipeId, alunoId1, grupoId2);
+    adicionarAlunoAoGrupoEquipe(equipeId, alunoId2, grupoId1);
   }
   // Prévia/relatório (mantido, agora com categoria em cada grupo): cada
   // grupo com seus alunos -- um aluno aparece em todos os grupos aos
@@ -4418,6 +4539,7 @@ const DB = (() => {
     adicionarAlunoAoGrupoEquipe, removerAlunoDoGrupoEquipe, getAlunosDoGrupoEquipe,
     resumoGruposEquipe, distribuirAutomaticamenteGrupos,
     resumoGruposEquipePorCategoria, alunosElegiveisEquipePorCategoria,
+    trocarAlunosEntreGrupos,
     getJogadoresPorGrupoPadrao, definirJogadoresPorGrupoPadrao,
     getTurmasAtivasDaSerie,
     getJogos, getJogo, existeConfrontoIdentico, criarJogo, atualizarJogo, excluirJogo,
@@ -4461,6 +4583,8 @@ const DB = (() => {
     criarAgrupamento, editarAgrupamento, separarAgrupamento, resumoInscricoesPorAgrupamento,
     contextoApresentacaoResultado, situacaoAmigavelParticipacao,
     relatorioClassificadosSimplificado, relatorioResultadoDetalhado, relatorioCampeoesChaveamentoFinal,
+    getQuantidadeClassificadosDireta, definirQuantidadeClassificadosDireta, alunosElegiveisSeletivaContexto,
+    classificadosDiretosAtuais, salvarClassificacaoDireta,
     relatorioColetivasContexto,
     relatorioInscritosPorModalidade, relatorioResultadosSeletivasDaTurma, relatorioResultadosJiba,
     quadroDeMedalhasJiba, calcularPendencias, resumoGeralRelatorio,
@@ -5980,10 +6104,62 @@ function rotuloContextoChaveamento(c){
    sendo por série+modalidade+categoria (mesma tabela/lógica de sempre) --
    a turma aqui é só um atalho de navegação e um filtro inicial na tela de
    alunos, exatamente como o professor já usa em sala. */
+function ligarEventosClassificacaoDireta(serieId, turmaId, modalidadeId, categoria){
+  const inputQtd = document.getElementById('inputQtdClassifDireta');
+  if(inputQtd){
+    inputQtd.addEventListener('change', () => {
+      const v = Number(inputQtd.value);
+      if(v > 0){
+        try { DB.definirQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, turmaId, v); }
+        catch(e){ alert(e.message); }
+      }
+    });
+  }
+  const checks = document.querySelectorAll('.check-classif-direta');
+  const contagemEl = document.getElementById('contagemClassifDireta');
+  const btnSalvar = document.getElementById('btnSalvarClassifDireta');
+  function atualizarContagem(){
+    if(!contagemEl) return;
+    const marcados = document.querySelectorAll('.check-classif-direta:checked').length;
+    const quantidade = DB.getQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, turmaId);
+    const ok = quantidade > 0 ? marcados === quantidade : marcados > 0;
+    contagemEl.textContent = quantidade > 0 ? `Selecionados: ${marcados} de ${quantidade}` : `Selecionados: ${marcados}`;
+    contagemEl.style.color = ok ? 'var(--cor-vitoria)' : 'var(--cor-derrota)';
+    if(btnSalvar) btnSalvar.disabled = !ok;
+  }
+  checks.forEach(chk => chk.addEventListener('change', atualizarContagem));
+  atualizarContagem();
+
+  const btnCancelar = document.getElementById('btnCancelarClassifDireta');
+  if(btnCancelar) btnCancelar.addEventListener('click', () => { location.hash = `#/classificacao-direta/${serieId}/${turmaId}/${modalidadeId}`; });
+
+  if(btnSalvar){
+    btnSalvar.addEventListener('click', async () => {
+      const ids = Array.from(document.querySelectorAll('.check-classif-direta:checked')).map(chk => chk.value);
+      const textoOriginal = btnSalvar.textContent;
+      btnSalvar.disabled = true; btnSalvar.textContent = 'Salvando...';
+      try {
+        await DB.salvarClassificacaoDireta(turmaId, modalidadeId, serieId, categoria, ids);
+      } catch(e){
+        console.error('Erro ao salvar classificação direta:', e);
+        alert(e && e.message ? e.message : 'Não foi possível salvar. Verifique sua conexão e tente novamente.');
+        btnSalvar.disabled = false; btnSalvar.textContent = textoOriginal;
+        return;
+      }
+      mostrarToast('Classificados salvos.');
+      renderizar();
+    });
+  }
+}
+
 function telaSeletivas(){
   const series = DB.getSeries().filter(s => s.ativo);
   return `
     <button class="botao-voltar" onclick="location.hash='#/'">&larr; Início</button>
+    <a href="#/classificacao-direta" class="cartao-escolha" style="border-color:var(--azul-quadra); margin-bottom:14px;">
+      <div><div class="titulo-escolha">🏅 Classificação direta</div><div class="sub-escolha">Registrar classificados sem criar chaveamento</div></div>
+      <span style="color:var(--texto-suave);">›</span>
+    </a>
     <div class="secao-titulo">🎯 Seletivas — Escolha a série</div>
     ${!series.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma série ativa cadastrada.</p>' : series.map(s => `
       <a href="#/seletivas/${s.id}" class="cartao-escolha">
@@ -5991,6 +6167,124 @@ function telaSeletivas(){
         <span style="color:var(--texto-suave);">›</span>
       </a>
     `).join('')}
+  `;
+}
+
+function telaClassifDiretaEscolherSerie(){
+  const series = DB.getSeries().filter(s => s.ativo);
+  return `
+    <button class="botao-voltar" onclick="location.hash='#/seletivas'">&larr; Seletivas</button>
+    <div class="secao-titulo">🏅 Classificação direta — Escolha a série</div>
+    ${!series.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma série ativa cadastrada.</p>' : series.map(s => `
+      <a href="#/classificacao-direta/${s.id}" class="cartao-escolha">
+        <div><div class="titulo-escolha">${s.nome}</div></div>
+        <span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
+  `;
+}
+
+function telaClassifDiretaEscolherTurma(serieId){
+  const serie = DB.getSeries().find(s => s.id === serieId);
+  if(!serie){
+    return `<button class="botao-voltar" onclick="location.hash='#/classificacao-direta'">&larr; Classificação direta</button>
+      <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Série não encontrada</h2></div>`;
+  }
+  const turmas = DB.getTurmasAtivasDaSerie(serieId);
+  const grupos = DB.getAgrupamentosAtivosDaSerie(serieId);
+  return `
+    <button class="botao-voltar" onclick="location.hash='#/classificacao-direta'">&larr; Trocar série</button>
+    <div class="secao-titulo">🏅 Classificação direta — ${serie.nome} — Escolha a turma</div>
+    ${grupos.map(g => `
+      <a href="#/classificacao-direta/${serieId}/${g.id}" class="cartao-escolha" style="border-color:var(--azul-quadra);">
+        <div><div class="titulo-escolha">🔗 ${g.nome}</div><div class="sub-escolha">Grupo de competição</div></div>
+        <span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
+    ${!turmas.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma turma ativa nesta série.</p>' : turmas.map(t => `
+      <a href="#/classificacao-direta/${serieId}/${t.id}" class="cartao-escolha">
+        <div><div class="titulo-escolha">${serie.nome} ${t.turma}</div><div class="sub-escolha">${t.turno}</div></div>
+        <span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
+  `;
+}
+
+function telaClassifDiretaEscolherModalidade(serieId, turmaId){
+  const ctx = resolverContextoChaveamento(turmaId);
+  if(!ctx){
+    return `<button class="botao-voltar" onclick="location.hash='#/classificacao-direta'">&larr; Classificação direta</button>
+      <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Não encontrado</h2></div>`;
+  }
+  const modalidades = DB.modalidadesDaSerie(serieId).filter(m => m.tipo === 'Individual');
+  return `
+    <button class="botao-voltar" onclick="location.hash='#/classificacao-direta/${serieId}'">&larr; Trocar turma</button>
+    <div class="secao-titulo">🏅 Classificação direta — ${ctx.rotulo} — Escolha a modalidade</div>
+    ${!modalidades.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhuma modalidade individual vinculada a esta série.</p>' : modalidades.map(m => `
+      <a href="#/classificacao-direta/${serieId}/${turmaId}/${m.id}" class="cartao-modalidade-seletiva">
+        <div><div class="nome-modalidade-sel">${iconeModalidade(m.nome)} ${m.nome}</div></div>
+        <span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
+  `;
+}
+
+function telaClassifDiretaEscolherCategoria(serieId, turmaId, modalidadeId){
+  const ctx = resolverContextoChaveamento(turmaId);
+  const modalidade = DB.getModalidades().find(m => m.id === modalidadeId);
+  if(!ctx || !modalidade){
+    return `<button class="botao-voltar" onclick="location.hash='#/classificacao-direta'">&larr; Classificação direta</button>
+      <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Não encontrado</h2></div>`;
+  }
+  return `
+    <button class="botao-voltar" onclick="location.hash='#/classificacao-direta/${serieId}/${turmaId}'">&larr; Trocar modalidade</button>
+    <div class="secao-titulo">${iconeModalidade(modalidade.nome)} ${modalidade.nome} — ${ctx.rotulo}</div>
+    ${['Masculino','Feminino'].map(cat => `
+      <a href="#/classificacao-direta/${serieId}/${turmaId}/${modalidadeId}/${cat}" class="cartao-escolha">
+        <div><div class="titulo-escolha">${cat}</div></div><span style="color:var(--texto-suave);">›</span>
+      </a>
+    `).join('')}
+  `;
+}
+
+function telaClassificacaoDireta(serieId, turmaId, modalidadeId, categoria){
+  const ctx = resolverContextoChaveamento(turmaId);
+  const modalidade = DB.getModalidades().find(m => m.id === modalidadeId);
+  if(!ctx || !modalidade){
+    return `<button class="botao-voltar" onclick="location.hash='#/classificacao-direta'">&larr; Classificação direta</button>
+      <div class="tela-em-breve"><div class="icone-grande">❓</div><h2>Não encontrado</h2></div>`;
+  }
+  const elegiveis = DB.alunosElegiveisSeletivaContexto(turmaId, modalidadeId, serieId, categoria)
+    .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+  const atuais = new Set(DB.classificadosDiretosAtuais(turmaId, modalidadeId, serieId, categoria).map(a => a.id));
+  const quantidade = DB.getQuantidadeClassificadosDireta(modalidadeId, serieId, categoria, turmaId);
+  return `
+    <button class="botao-voltar no-print" onclick="location.hash='#/classificacao-direta/${serieId}/${turmaId}/${modalidadeId}'">&larr; Voltar</button>
+    <div class="bloco">
+      <h3 style="margin:0;">🏅 Classificação direta — ${iconeModalidade(modalidade.nome)} ${modalidade.nome}</h3>
+      <p style="font-size:13px; color:var(--texto-suave); margin:4px 0 0;">${ctx.rotulo} · ${categoria}</p>
+      <p style="font-size:12px; color:var(--texto-suave); margin:8px 0 0;">Para seletivas realizadas fora do aplicativo, ou quando o classificado já está definido -- sem precisar criar chaveamento.</p>
+    </div>
+    <div class="bloco">
+      <div class="campo" style="margin-bottom:0;">
+        <label for="inputQtdClassifDireta">Quantidade de classificados</label>
+        <input type="number" id="inputQtdClassifDireta" min="1" value="${quantidade || ''}" placeholder="não definida">
+      </div>
+    </div>
+    ${!elegiveis.length ? '<p style="color:var(--texto-suave); font-size:14px;">Nenhum aluno inscrito nesta seletiva ainda.</p>' : `
+      <div class="bloco">
+        ${elegiveis.map(a => `
+          <label class="item-checkbox-modalidade ${atuais.has(a.id) ? 'marcado' : ''}" style="margin-bottom:8px;">
+            <input type="checkbox" class="check-classif-direta" value="${a.id}" ${atuais.has(a.id) ? 'checked' : ''}> ${a.nome}${ctx.tipo === 'grupo' ? ` — ${nomeExibidoTurma(a.turmaId)}` : ''}
+          </label>
+        `).join('')}
+      </div>
+      <p id="contagemClassifDireta" class="no-print" style="font-size:13px; font-weight:700; margin:10px 0;"></p>
+      <div style="display:flex; gap:10px;">
+        <button class="botao-texto" id="btnCancelarClassifDireta" type="button" style="flex:1;">Cancelar</button>
+        <button class="botao botao-primario" id="btnSalvarClassifDireta" type="button" style="flex:2;">Salvar classificados</button>
+      </div>
+    `}
   `;
 }
 
@@ -6554,6 +6848,7 @@ function telaEquipesEscolherModalidade(serieId, turmaId){
 }
 
 let filtroCategoriaGrupoAtual = 'Masculino'; // estado da tela de Grupos (Masculino/Feminino/Misto)
+let modoAjustarAlunosAtivo = false; // estado da tela de Grupos: selecionar 2 alunos de grupos diferentes para trocar
 
 // Tela dedicada de Grupos (nova): reaproveita 100% a mesma equipe/
 // participação de sempre (DB.obterOuCriarEquipe, DB.getParticipacoesEquipe
@@ -6570,6 +6865,7 @@ function telaGruposEquipe(serieId, turmaId, modalidadeId){
   }
   const equipe = DB.obterOuCriarEquipePorContexto(turmaId, modalidadeId);
   DB.alunosElegiveisEquipePorContexto(turmaId, modalidadeId).forEach(a => DB.obterOuCriarParticipacaoEquipe(equipe.id, a.id));
+  modoAjustarAlunosAtivo = false; // tela recém-aberta sempre começa fora do modo de ajuste
 
   return `
     <button class="botao-voltar no-print" onclick="location.hash='#/equipes/${serieId}/${turmaId}/${modalidadeId}'">&larr; Voltar à equipe</button>
@@ -6604,6 +6900,9 @@ function telaGruposEquipe(serieId, turmaId, modalidadeId){
       <button class="botao botao-secundario" id="btnDistribuirAuto" type="button" style="width:100%;">🔀 Distribuir automaticamente</button>
     </div>
 
+    <button class="botao botao-secundario" id="btnAjustarAlunos" type="button" style="width:100%; margin-bottom:14px;">🔄 Ajustar alunos</button>
+    <div id="areaAjustarAlunos" class="no-print"></div>
+
     <div id="listaGruposEquipeCategoria"></div>
   `;
 }
@@ -6635,7 +6934,10 @@ function renderListaGruposEquipeCategoria(equipeId, categoria){
           <ol class="lista-numerada" style="margin:0 0 12px;">
             ${alunosDoGrupo.map(a => `
               <li style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-                <span>${a.nome}</span>
+                <span style="display:flex; align-items:center; gap:8px;">
+                  ${modoAjustarAlunosAtivo ? `<input type="checkbox" class="check-ajustar-aluno" data-aluno="${a.id}" data-grupo="${grupo.id}" style="width:18px; height:18px;">` : ''}
+                  ${a.nome}
+                </span>
                 <button type="button" class="botao-texto" data-acao="remover-do-grupo" data-grupo="${grupo.id}" data-aluno="${a.id}" style="color:#B23A3A; font-size:12px;">remover</button>
               </li>
             `).join('')}
@@ -6664,9 +6966,26 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       btn.classList.toggle('botao-secundario', !ativo);
     });
   }
+  function atualizarAreaAjustarAlunos(){
+    const area = document.getElementById('areaAjustarAlunos');
+    const btnModo = document.getElementById('btnAjustarAlunos');
+    if(btnModo) btnModo.textContent = modoAjustarAlunosAtivo ? '✖️ Sair do ajuste de alunos' : '🔄 Ajustar alunos';
+    if(!area) return;
+    if(!modoAjustarAlunosAtivo){ area.innerHTML = ''; return; }
+    const qtdMarcados = document.querySelectorAll('.check-ajustar-aluno:checked').length;
+    area.innerHTML = `
+      <div class="bloco" style="background:var(--azul-quadra); color:#fff;">
+        <p style="margin:0 0 10px; font-size:13px; font-weight:700;">Marque 2 alunos de grupos diferentes para trocar de posição. Selecionados: <span id="contagemAjustarAlunos">${qtdMarcados}</span> de 2</p>
+        <div style="display:flex; gap:10px;">
+          <button class="botao botao-primario" id="btnTrocarAlunos" type="button" style="flex:1;" ${qtdMarcados === 2 ? '' : 'disabled'}>🔄 Trocar</button>
+        </div>
+      </div>
+    `;
+  }
   function atualizarTudo(){
     atualizarBotoesFiltro();
     renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+    atualizarAreaAjustarAlunos();
   }
   atualizarTudo();
 
@@ -6675,6 +6994,43 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       filtroCategoriaGrupoAtual = btn.dataset.categoria;
       atualizarTudo();
     });
+  });
+
+  document.getElementById('btnAjustarAlunos').addEventListener('click', () => {
+    modoAjustarAlunosAtivo = !modoAjustarAlunosAtivo;
+    atualizarTudo();
+  });
+
+  // Delegação: os checkboxes de ajuste são recriados a cada re-render da
+  // lista de grupos, então o listener fica no container estável.
+  document.getElementById('listaGruposEquipeCategoria').addEventListener('change', e => {
+    if(e.target.classList.contains('check-ajustar-aluno')){
+      const marcados = Array.from(document.querySelectorAll('.check-ajustar-aluno:checked'));
+      if(marcados.length > 2){
+        e.target.checked = false; // só permite 2 selecionados por vez
+        alert('Selecione no máximo 2 alunos para trocar.');
+      }
+      atualizarAreaAjustarAlunos();
+    }
+  });
+
+  document.getElementById('areaAjustarAlunos').addEventListener('click', e => {
+    const btnTrocar = e.target.closest('#btnTrocarAlunos');
+    if(!btnTrocar) return;
+    const marcados = Array.from(document.querySelectorAll('.check-ajustar-aluno:checked'));
+    if(marcados.length !== 2) return;
+    const [c1, c2] = marcados;
+    if(c1.dataset.grupo === c2.dataset.grupo){
+      alert('Escolha alunos de grupos diferentes para trocar.');
+      return;
+    }
+    try {
+      DB.trocarAlunosEntreGrupos(equipeId, c1.dataset.aluno, c1.dataset.grupo, c2.dataset.aluno, c2.dataset.grupo);
+      mostrarToast('Alunos trocados de grupo.');
+      atualizarTudo();
+    } catch(err){
+      alert(err.message || 'Não foi possível trocar os alunos.');
+    }
   });
 
   document.getElementById('btnCriarGrupo').addEventListener('click', () => {
@@ -6686,6 +7042,7 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       input.value = '';
       mostrarToast('Grupo criado.');
       renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
     } catch(err){
       alert(err.message || 'Não foi possível criar o grupo.');
     }
@@ -6710,6 +7067,7 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       DB.definirJogadoresPorGrupoPadrao(modalidadeId, jogadoresPorGrupo);
       mostrarToast('Alunos distribuídos automaticamente.');
       renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
     } catch(err){
       alert(err.message || 'Não foi possível distribuir automaticamente.');
     }
@@ -6724,6 +7082,7 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       try {
         DB.renomearGrupoEquipe(equipeId, btnRenomear.dataset.id, novoNome.trim());
         renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
       } catch(err){ alert(err.message || 'Não foi possível renomear.'); }
       return;
     }
@@ -6733,12 +7092,14 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       DB.excluirGrupoEquipe(equipeId, btnExcluir.dataset.id);
       mostrarToast('Grupo excluído.');
       renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
       return;
     }
     const btnRemoverDoGrupo = e.target.closest('button[data-acao="remover-do-grupo"]');
     if(btnRemoverDoGrupo){
       DB.removerAlunoDoGrupoEquipe(equipeId, btnRemoverDoGrupo.dataset.aluno, btnRemoverDoGrupo.dataset.grupo);
       renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
       return;
     }
     const btnAdicionarAoGrupo = e.target.closest('button[data-acao="adicionar-ao-grupo"]');
@@ -6750,6 +7111,7 @@ function ligarEventosGruposEquipe(serieId, turmaId, modalidadeId){
       try {
         DB.adicionarAlunoAoGrupoEquipe(equipeId, alunoId, grupoId);
         renderListaGruposEquipeCategoria(equipeId, filtroCategoriaGrupoAtual);
+      atualizarAreaAjustarAlunos();
       } catch(err){ alert(err.message || 'Não foi possível adicionar.'); }
     }
   });
@@ -11061,6 +11423,16 @@ function telaRelatorioChaveamentoDireto(chaveamentoId){
    Reaproveita DB.relatorioClassificadosSimplificado, que lê diretamente
    as seletivas/participações já existentes (Bloco 3) -- nenhuma tabela
    nova, nenhuma pontuação. */
+// Impressão (só visual): quantas colunas usar para os grupos de uma
+// categoria, lado a lado, de acordo com a quantidade de grupos --
+// 1->1, 2->2, 3->3, 4 ou mais->2 (forma 2x2, 2x3... conforme o caso).
+function colunasGradeGrupos(quantidadeGrupos){
+  if(quantidadeGrupos <= 1) return 1;
+  if(quantidadeGrupos === 2) return 2;
+  if(quantidadeGrupos === 3) return 3;
+  return 2;
+}
+
 function conteudoClassificadosSimplificado(resumo){
   const cfg = DB.getConfig();
   const rotuloTurmas = resumo.tipo === 'grupo'
@@ -11069,7 +11441,7 @@ function conteudoClassificadosSimplificado(resumo){
 
   function colunaClassificados(lista){
     return lista.length
-      ? `<ol class="lista-classificados">${lista.map(a => `<li>${a.nome}</li>`).join('')}</ol>`
+      ? `<ul class="lista-classificados-conferencia">${lista.map(a => `<li>${a.nome}</li>`).join('')}</ul>`
       : '<p class="vazio-classificados">—</p>';
   }
 
@@ -11113,10 +11485,14 @@ function conteudoClassificadosSimplificado(resumo){
           ${item.categorias.map(secaoCategoria => `
             <div style="margin-top:8px;">
               <div class="rotulo-coluna-classificados">${secaoCategoria.categoria === 'Masculino' ? '👨' : secaoCategoria.categoria === 'Feminino' ? '👩' : '👥'} ${secaoCategoria.categoria.toUpperCase()}</div>
-              ${secaoCategoria.grupos.map(g => `
-                <p style="font-size:12.5px; font-weight:700; margin:8px 0 2px;">${g.grupo.nome} — ${g.alunos.length} jogador${g.alunos.length === 1 ? '' : 'es'}</p>
-                <ol class="lista-classificados">${g.alunos.map(a => `<li>${a.nome}${item.agrupamento ? ` — ${nomeExibidoTurma(a.turmaId)}` : ''}</li>`).join('')}</ol>
-              `).join('')}
+              <div class="grade-grupos-coletiva grade-grupos-cols-${colunasGradeGrupos(secaoCategoria.grupos.length)}">
+                ${secaoCategoria.grupos.map(g => `
+                  <div class="coluna-grupo-coletiva">
+                    <p style="font-size:12.5px; font-weight:700;">${g.grupo.nome} — ${g.alunos.length} jogador${g.alunos.length === 1 ? '' : 'es'}</p>
+                    <ul class="lista-classificados-conferencia">${g.alunos.map(a => `<li>${a.nome}${item.agrupamento ? ` — ${nomeExibidoTurma(a.turmaId)}` : ''}</li>`).join('')}</ul>
+                  </div>
+                `).join('')}
+              </div>
             </div>
           `).join('')}
         </div>
@@ -12030,6 +12406,30 @@ async function renderizar(){
     renderResumoTurma(turmaId);
     renderListaAlunosTurma(turmaId);
     ligarEventosFichaTurma(turmaId);
+  } else if(rota === '#/classificacao-direta'){
+    app.innerHTML = telaClassifDiretaEscolherSerie();
+  } else if(rota.match(/^#\/classificacao-direta\/[^/]+\/[^/]+\/[^/]+\/[^/]+$/)){
+    const [, serieId, turmaId, modalidadeId, categoria] = rota.match(/^#\/classificacao-direta\/([^/]+)\/([^/]+)\/([^/]+)\/([^/]+)$/);
+    app.innerHTML = '<p style="padding:40px 20px; text-align:center; color:var(--texto-suave);">Carregando...</p>';
+    try {
+      await DB.garantirSeletivaEParticipacoes(modalidadeId, serieId, categoria);
+    } catch(e){
+      console.error('Erro ao carregar a seletiva:', e);
+      app.innerHTML = '<p style="padding:40px 20px; text-align:center; color:var(--texto-suave);">Não foi possível carregar. Verifique sua conexão e tente novamente.</p>';
+      window.scrollTo(0,0);
+      return;
+    }
+    app.innerHTML = telaClassificacaoDireta(serieId, turmaId, modalidadeId, categoria);
+    ligarEventosClassificacaoDireta(serieId, turmaId, modalidadeId, categoria);
+  } else if(rota.match(/^#\/classificacao-direta\/[^/]+\/[^/]+\/[^/]+$/)){
+    const [, serieId, turmaId, modalidadeId] = rota.match(/^#\/classificacao-direta\/([^/]+)\/([^/]+)\/([^/]+)$/);
+    app.innerHTML = telaClassifDiretaEscolherCategoria(serieId, turmaId, modalidadeId);
+  } else if(rota.match(/^#\/classificacao-direta\/[^/]+\/[^/]+$/)){
+    const [, serieId, turmaId] = rota.match(/^#\/classificacao-direta\/([^/]+)\/([^/]+)$/);
+    app.innerHTML = telaClassifDiretaEscolherModalidade(serieId, turmaId);
+  } else if(rota.match(/^#\/classificacao-direta\/[^/]+$/)){
+    const serieId = rota.split('#/classificacao-direta/')[1];
+    app.innerHTML = telaClassifDiretaEscolherTurma(serieId);
   } else if(rota === '#/seletivas'){
     app.innerHTML = telaSeletivas();
   } else if(rota.match(/^#\/seletivas\/fase\/[^/]+\/[^/]+\/[^/]+\/[^/]+\/[^/]+$/)){
